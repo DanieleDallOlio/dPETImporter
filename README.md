@@ -8,7 +8,7 @@
 
 | **Authors**  | **Project** |
 |:------------:|:-----------:|
-| [**D. Dall'Olio**](https://github.com/DanieleDallOlio)  |  TCGA-BRCA-OmicsImaging  |
+| [**D. Dall'Olio**](https://github.com/DanieleDallOlio)  |  dPETImporter  |
 
 **dPETImporter** is a DICOM plugin for **3D Slicer** that enables automatic loading of **dynamic PET (dPET)** studies as time-resolved image sequences.
 
