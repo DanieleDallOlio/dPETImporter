@@ -743,7 +743,9 @@ class dPETImporterPluginClass(DICOMPlugin):
     volumeSequenceNode.SetAttribute("dPETImporter.LoadedBy", "dPETImporterPlugin")
     volumeSequenceNode.SetAttribute("dPETImporter.Version", "0.1")  # optional
     volumeSequenceNode.SetAttribute("dPETImporter.Source", "DICOM") # optional
-    for attr in mvNode.GetAttributeNames():
+    attrNames = mvNode.GetAttributeNames()
+    for i in range(attrNames.GetNumberOfValues()):
+      attr = attrNames.GetValue(i)
       volumeSequenceNode.SetAttribute(attr, mvNode.GetAttribute(attr))
 
     try:
@@ -866,12 +868,12 @@ class dPETImporterPluginClass(DICOMPlugin):
         appLogic.PropagateVolumeSelection()
       # add to subject hierarchy
       self.addSeriesInSubjectHierarchy(loadable, proxyVol if proxyVol else volumeSequenceNode)
+      volumeSequenceNode.SetAttribute("dPET.SUVbwFactor", str(sequenceSUV))
       return volumeSequenceNode
     except Exception as e:
       logging.error(f"dPET import failed: {e}")
       import traceback
       traceback.print_exc()
-      return None
       return None
     finally:
       progressbar.close()
