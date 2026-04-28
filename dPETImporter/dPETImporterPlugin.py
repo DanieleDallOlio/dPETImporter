@@ -744,8 +744,8 @@ class dPETImporterPluginClass(DICOMPlugin):
     volumeSequenceNode.SetAttribute("dPETImporter.Version", "0.1")  # optional
     volumeSequenceNode.SetAttribute("dPETImporter.Source", "DICOM") # optional
     attrNames = mvNode.GetAttributeNames()
-    for i in range(attrNames.GetNumberOfValues()):
-      attr = attrNames.GetValue(i)
+    for i in range(len(attrNames)):
+      attr = attrNames[i]
       volumeSequenceNode.SetAttribute(attr, mvNode.GetAttribute(attr))
 
     try:
@@ -806,6 +806,7 @@ class dPETImporterPluginClass(DICOMPlugin):
         if seqDataNode is None:
           # fallback: maybe UpdateDataNodeAtValue did not set the stored node; try to use frameNode
           seqDataNode = frameNode
+        seqDataNode.SetAttribute("dPETImporter.LoadedBy", "dPETImporterPlugin")
 
         # set per-frame attributes on the stored volume node
         if fi < len(frame_durations) and frame_durations[fi] not in (None, ""):
