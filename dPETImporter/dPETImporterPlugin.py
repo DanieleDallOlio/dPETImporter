@@ -401,6 +401,30 @@ class dPETImporterPluginClass(DICOMPlugin):
     volumeNode.Modified()
     return True
 
+
+  def _validateUnits(self, mvNode):
+    units = (mvNode.GetAttribute('Units') or '').upper()
+    suvType = (mvNode.GetAttribute('SUVType') or '').upper()
+
+    if not units:
+      logging.error("[dPET] Missing Units (0054,1001)")
+      return False, None
+
+    if units == "BQML":
+      return True, "BQML"
+
+    # Not BQML → must be SUV-like
+    if units == "GML":
+      # SUV must have type or be inferable
+      if not suvType:
+        logging.warning("[dPET] Units=GML but SUVType missing; assuming BW")
+        suvType = "BW"
+      return True, "SUV"
+
+    # Any other unit → unsupported
+    logging.error(f"[dPET] Unsupported Units: {units}. Please follow the DICOM standard.")
+    return False, None
+
   def initMultiVolumes(self, files, prescribedTags=None):
     tag2ValueFileList = {}
     multivolumes = []
@@ -562,6 +586,8 @@ class dPETImporterPluginClass(DICOMPlugin):
 
       # Patient
       setAttrIfFound('PatientWeight', "0010,1030")  # Patient's Weight (kg)
+      setAttrIfFound('Units', "0054,1001")     # Units
+      setAttrIfFound('SUVType', "0054,1006")   # SUV Type (optional)
 
       # PET corrections
       setAttrIfFound('DecayCorrection', "0054,1102")   # Decay Correction
@@ -729,6 +755,11 @@ class dPETImporterPluginClass(DICOMPlugin):
     except AttributeError:
       return None
 
+    ok, unitType = self._validateUnits(mvNode)
+    if not ok:
+      logging.error("[dPET] Invalid or unsupported PET units. Skipping load.")
+      return None
+
     nFrames = int(mvNode.GetAttribute('MultiVolume.NumberOfFrames'))
     files = mvNode.GetAttribute('MultiVolume.FrameFileList').split(',')
     nFiles = len(files)
@@ -743,15 +774,12 @@ class dPETImporterPluginClass(DICOMPlugin):
     volumeSequenceNode.SetAttribute("dPETImporter.LoadedBy", "dPETImporterPlugin")
     volumeSequenceNode.SetAttribute("dPETImporter.Version", "0.1")  # optional
     volumeSequenceNode.SetAttribute("dPETImporter.Source", "DICOM") # optional
-    attrNames = mvNode.GetAttributeNames()
-    for i in range(len(attrNames)):
-      attr = attrNames[i]
+    for attr in mvNode.GetAttributeNames():
       volumeSequenceNode.SetAttribute(attr, mvNode.GetAttribute(attr))
 
     try:
       frame_times = json.loads(mvNode.GetAttribute('dPET.FrameTimes') or '[]')
     except Exception:
-      # fallback to comma-separated string if needed
       times_attr = mvNode.GetAttribute('dPET.FrameTimes') or ''
       frame_times = times_attr.split(',') if times_attr else []
 
@@ -761,28 +789,31 @@ class dPETImporterPluginClass(DICOMPlugin):
       dur_attr = mvNode.GetAttribute('dPET.FrameDurations') or ''
       frame_durations = [float(x) if x else None for x in dur_attr.split(',')] if dur_attr else []
 
-    # store the arrays on sequence node for convenience
     try:
       if frame_times:
         volumeSequenceNode.SetAttribute('dPET.FrameTimes', json.dumps(frame_times))
       if frame_durations:
         volumeSequenceNode.SetAttribute('dPET.FrameDurations', json.dumps(frame_durations))
     except Exception:
-      # ignore attribute write errors
       pass
 
     scalarVolumePlugin = slicer.modules.dicomPlugins['DICOMScalarVolumePlugin']()
-    progressbar = slicer.util.createProgressDialog(labelText=f"Loading {baseName}", value=0, maximum=nFrames, windowModality=qt.Qt.WindowModal)
-    sequenceValueType = "BQML"
+    progressbar = slicer.util.createProgressDialog(
+        labelText=f"Loading {baseName}",
+        value=0,
+        maximum=nFrames,
+        windowModality=qt.Qt.WindowModal
+    )
+    sequenceValueType = "BQML" if unitType == "BQML" else "SUVbw"
     try:
-      # read each frame into scalar volume
-
       doSUV = settingsValue("DICOM/dPETImporterSUVEnabled", True, converter=toBool)
 
       sequenceSUV = None
-      if doSUV and self._isDecayCorrectedToFirstFrameStart(mvNode):
-        sequenceSUV = compute_suvbw_for_start(mvNode)
-      if doSUV and sequenceSUV is None:
+      if unitType == "BQML":
+        if doSUV and self._isDecayCorrectedToFirstFrameStart(mvNode):
+          sequenceSUV = compute_suvbw_for_start(mvNode)
+
+      if unitType == "BQML" and doSUV and sequenceSUV is None:
         logging.warning("[dPET] SUV conversion disabled: series is not usable as decay-corrected-to-first-frame START.")
 
       for fi in range(nFrames):
@@ -802,34 +833,35 @@ class dPETImporterPluginClass(DICOMPlugin):
         volumeSequenceNode.UpdateDataNodeAtValue(frameNode, idx, True)
 
         # get stored data node for this index (some Slicer versions return the actual node)
-        seqDataNode = volumeSequenceNode.GetDataNodeAtValue(idx)
-        if seqDataNode is None:
-          # fallback: maybe UpdateDataNodeAtValue did not set the stored node; try to use frameNode
-          seqDataNode = frameNode
+        seqDataNode = volumeSequenceNode.GetDataNodeAtValue(idx) or frameNode
         seqDataNode.SetAttribute("dPETImporter.LoadedBy", "dPETImporterPlugin")
 
         # set per-frame attributes on the stored volume node
         if fi < len(frame_durations) and frame_durations[fi] not in (None, ""):
           seqDataNode.SetAttribute('dPET.Duration', str(frame_durations[fi]))
           volumeSequenceNode.SetAttribute(f'dPET.Frame.{idx}.Duration', str(frame_durations[fi]))
+
         if fi < len(frame_times) and frame_times[fi]:
           seqDataNode.SetAttribute('dPET.AcquisitionTime', str(frame_times[fi]))
           volumeSequenceNode.SetAttribute(f'dPET.Frame.{idx}.AcquisitionTime', str(frame_times[fi]))
 
-        # try compute SUVbw factor if mvNode contains radionuclide/series metadata
-        if sequenceSUV is not None:
-          seqDataNode.SetAttribute('dPET.SUVbwFactor', str(sequenceSUV))
-          volumeSequenceNode.SetAttribute(f'dPET.Frame.{idx}.SUVbwFactor', str(sequenceSUV))
-
-        if doSUV and (sequenceSUV is not None):
-          ok = self._multiplyVolumeByConstant(seqDataNode, sequenceSUV)
-          if ok:
-            seqDataNode.SetAttribute('dPET.ValueType', 'SUVbw')
-            sequenceValueType = "SUVbw"
+        # --- ValueType + SUV handling ---
+        if unitType == "BQML":
+          if doSUV and (sequenceSUV is not None):
+            ok = self._multiplyVolumeByConstant(seqDataNode, sequenceSUV)
+            if ok:
+              seqDataNode.SetAttribute('dPET.ValueType', 'SUVbw')
+              seqDataNode.SetAttribute('dPET.SUVbwFactor', str(sequenceSUV))
+              volumeSequenceNode.SetAttribute(f'dPET.Frame.{idx}.SUVbwFactor', str(sequenceSUV))
+              sequenceValueType = "SUVbw"
+            else:
+              seqDataNode.SetAttribute('dPET.ValueType', 'BQML')
           else:
             seqDataNode.SetAttribute('dPET.ValueType', 'BQML')
         else:
-          seqDataNode.SetAttribute('dPET.ValueType', 'BQML')
+          seqDataNode.SetAttribute('dPET.ValueType', 'SUVbw')
+          seqDataNode.SetAttribute('dPET.SUVbwFactor', '1.0')
+          volumeSequenceNode.SetAttribute(f'dPET.Frame.{idx}.SUVbwFactor', '1.0')
 
         # cleanup temporary nodes created by scalarVolumePlugin.load
         if frameNode.GetDisplayNode():
@@ -841,6 +873,12 @@ class dPETImporterPluginClass(DICOMPlugin):
 
       # create browser and show sequence
       volumeSequenceNode.SetAttribute('dPET.ValueType', sequenceValueType)
+
+      if sequenceSUV is not None:
+        volumeSequenceNode.SetAttribute("dPET.SUVbwFactor", str(sequenceSUV))
+      elif unitType != "BQML":
+        volumeSequenceNode.SetAttribute("dPET.SUVbwFactor", "1.0")
+
       browser = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLSequenceBrowserNode', slicer.mrmlScene.GenerateUniqueName(baseName + " browser"))
       if slicer.modules.sequences.widgetRepresentation():
         slicer.modules.sequences.widgetRepresentation().setActiveBrowserNode(browser)
@@ -849,27 +887,25 @@ class dPETImporterPluginClass(DICOMPlugin):
       browser.SetOverwriteProxyName(volumeSequenceNode, True)
       browser.SetAttribute("dPETImporter.LoadedBy", "dPETImporterPlugin")
       browser.SetAttribute("dPETImporter.SequenceNodeID", volumeSequenceNode.GetID())
-      proxyVol = browser.GetProxyNode(volumeSequenceNode)
-      appLogic = slicer.app.applicationLogic()
-      selNode = appLogic.GetSelectionNode()
       browser.SetAttribute('dPET.ValueType', sequenceValueType)
+      proxyVol = browser.GetProxyNode(volumeSequenceNode)
       if proxyVol:
         proxyVol.SetAttribute("dPETImporter.LoadedBy", "dPETImporterPlugin")
         proxyVol.SetAttribute('dPET.ValueType', sequenceValueType)
         self._setProxyQuantityUnits(proxyVol, sequenceValueType)
+
+        disp = proxyVol.GetDisplayNode() or proxyVol.CreateDefaultDisplayNodes()
         disp = proxyVol.GetDisplayNode()
-        if disp is None:
-          proxyVol.CreateDefaultDisplayNodes()
-          disp = proxyVol.GetDisplayNode()
         if disp:
           self.setPetDicomLUT(proxyVol)
           disp.SetAutoWindowLevel(True)
           disp.SetInterpolate(True)
+        appLogic = slicer.app.applicationLogic()
+        selNode = appLogic.GetSelectionNode()
         selNode.SetReferenceActiveVolumeID(proxyVol.GetID())
         appLogic.PropagateVolumeSelection()
       # add to subject hierarchy
       self.addSeriesInSubjectHierarchy(loadable, proxyVol if proxyVol else volumeSequenceNode)
-      volumeSequenceNode.SetAttribute("dPET.SUVbwFactor", str(sequenceSUV))
       return volumeSequenceNode
     except Exception as e:
       logging.error(f"dPET import failed: {e}")
