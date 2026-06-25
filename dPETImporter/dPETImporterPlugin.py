@@ -499,7 +499,7 @@ class dPETImporterPluginClass(DICOMPlugin):
       frame_times = []
       frame_durations = []
       # common duration tags (vendor-dependent)
-      dur_tags = ["0067,1004", "0018,1242"]  # (0067,1004) often ms, (0018,1242) vendor-specific
+      dur_tags = ["0067,1004", "0018,1242"]  # (0067,1004) expected in seconds, (0018,1242) expected in ms
       time_tags = ["0008,0032", "0008,002A", "0008,0031", "0008,0033", "0018,1075"]  # AcquisitionTime, AcquisitionDateTime, SeriesTime, ContentTime, Private
       for tv in tagValues:
         frame_files = tagValue2FileList[tv]
@@ -512,6 +512,7 @@ class dPETImporterPluginClass(DICOMPlugin):
             s = str(val)
             try:
               duration = float(s.split('\\')[0])
+              duration = duration/1000 if dt=="0018,1242" else duration
               # heuristics: many vendors use ms or sec; keep raw value; caller must interpret units
             except:
               duration = None
