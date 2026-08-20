@@ -128,8 +128,7 @@ dPETImporter/
 └── dPETImporter/
     ├── CMakeLists.txt
     ├── dPETImporter.py
-    ├── dPETImporterPlugin.py
-    └── reader.py
+    └── dPETImporterPlugin.py
 ```
 
 ---
