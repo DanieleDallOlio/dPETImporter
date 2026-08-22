@@ -917,6 +917,671 @@ class dPETImporterPluginClass(DICOMPlugin):
       progressbar.close()
 
 
+# -----------------------------------------------------------------------------
+# SlicerDynamicPET DICOM Parametric Map importer
+# -----------------------------------------------------------------------------
+
+class dPETParametricMapPluginClass(DICOMPlugin):
+
+  PARAMETRIC_MAP_SOP_CLASS_UID = \
+    "1.2.840.10008.5.1.4.1.1.30"
+
+  def __init__(self):
+    super().__init__()
+
+    self.loadType = "SlicerDynamicPET Parametric Map"
+
+    self.tags['sopClassUID'] = "0008,0016"
+    self.tags['sopInstanceUID'] = "0008,0018"
+    self.tags['seriesInstanceUID'] = "0020,000E"
+    self.tags['studyInstanceUID'] = "0020,000D"
+    self.tags['seriesDescription'] = "0008,103E"
+    self.tags['seriesNumber'] = "0020,0011"
+    self.tags['modality'] = "0008,0060"
+
+
+  def _ensureHighdicom(self):
+    try:
+      import highdicom as hd
+      return hd
+
+    except ImportError:
+      logging.info(
+        "[dPET PM] Installing highdicom 0.28.1..."
+      )
+
+      slicer.util.pip_install(
+        "highdicom==0.28.1"
+      )
+
+      import importlib
+      importlib.invalidate_caches()
+
+      import highdicom as hd
+      return hd
+
+
+  def examine(self, fileLists):
+    """
+    Offer DICOM Parametric Map Storage objects using our
+    dedicated PM loader instead of Slicer's generic scalar
+    volume loader.
+    """
+
+    loadables = []
+
+    for files in fileLists:
+      if not files:
+        continue
+
+      for filePath in files:
+
+        sopClassUID = (
+          slicer.dicomDatabase.fileValue(
+            filePath,
+            self.tags['sopClassUID']
+          )
+          or ""
+        )
+
+        if (
+          sopClassUID
+          != self.PARAMETRIC_MAP_SOP_CLASS_UID
+        ):
+          continue
+
+        seriesDescription = (
+          slicer.dicomDatabase.fileValue(
+            filePath,
+            self.tags['seriesDescription']
+          )
+          or
+          "SlicerDynamicPET Parametric Map"
+        )
+
+        seriesNumber = (
+          slicer.dicomDatabase.fileValue(
+            filePath,
+            self.tags['seriesNumber']
+          )
+          or ""
+        )
+
+        loadable = DICOMLoadable()
+
+        # One PM SOP instance is one loadable.
+        loadable.files = [filePath]
+
+        if seriesNumber:
+          loadable.name = (
+            f"{seriesNumber}: "
+            f"{seriesDescription}"
+          )
+        else:
+          loadable.name = seriesDescription
+
+        loadable.tooltip = (
+          "DICOM Parametric Map loaded by "
+          "SlicerDynamicPET/dPETImporter"
+        )
+
+        # Give this dedicated PM loader strong preference
+        # over the generic Scalar Volume DICOM plugin.
+        loadable.selected = True
+        loadable.confidence = 1.0
+
+        loadables.append(loadable)
+
+    return loadables
+
+
+  def _firstRealWorldValueMapping(self, pm):
+    """
+    Return the first Real World Value Mapping item.
+
+    PM commonly stores this in the Shared Functional Groups,
+    but handle per-frame storage too.
+    """
+
+    shared = getattr(
+      pm,
+      "SharedFunctionalGroupsSequence",
+      None
+    )
+
+    if shared and len(shared) > 0:
+      mappingSequence = getattr(
+        shared[0],
+        "RealWorldValueMappingSequence",
+        None
+      )
+
+      if (
+        mappingSequence is not None
+        and len(mappingSequence) > 0
+      ):
+        return mappingSequence[0]
+
+    perFrame = getattr(
+      pm,
+      "PerFrameFunctionalGroupsSequence",
+      None
+    )
+
+    if perFrame:
+      for functionalGroup in perFrame:
+
+        mappingSequence = getattr(
+          functionalGroup,
+          "RealWorldValueMappingSequence",
+          None
+        )
+
+        if (
+          mappingSequence is not None
+          and len(mappingSequence) > 0
+        ):
+          return mappingSequence[0]
+
+    return None
+
+
+  def _makeCodedEntry(
+      self,
+      codeValue,
+      codingScheme,
+      codeMeaning):
+
+    CodedEntryClass = (
+      getattr(vtk, "vtkCodedEntry", None)
+      or
+      getattr(slicer, "vtkCodedEntry", None)
+    )
+
+    if CodedEntryClass is None:
+      return None
+
+    entry = CodedEntryClass()
+
+    entry.SetValueSchemeMeaning(
+      str(codeValue),
+      str(codingScheme),
+      str(codeMeaning)
+    )
+
+    return entry
+
+
+  def _setParametricMapQuantityMetadata(
+      self,
+      volumeNode,
+      pm):
+
+    mapping = self._firstRealWorldValueMapping(
+      pm
+    )
+
+    if mapping is None:
+      return
+
+    quantityCode = str(
+      getattr(
+        mapping,
+        "LUTLabel",
+        ""
+      )
+      or ""
+    )
+
+    quantityMeaning = str(
+      getattr(
+        mapping,
+        "LUTExplanation",
+        quantityCode
+      )
+      or quantityCode
+    )
+
+    unitCode = ""
+    unitScheme = ""
+    unitMeaning = ""
+
+    unitsSequence = getattr(
+      mapping,
+      "MeasurementUnitsCodeSequence",
+      None
+    )
+
+    if (
+      unitsSequence is not None
+      and len(unitsSequence) > 0
+    ):
+      units = unitsSequence[0]
+
+      unitCode = str(
+        getattr(
+          units,
+          "CodeValue",
+          ""
+        )
+        or ""
+      )
+
+      unitScheme = str(
+        getattr(
+          units,
+          "CodingSchemeDesignator",
+          ""
+        )
+        or ""
+      )
+
+      unitMeaning = str(
+        getattr(
+          units,
+          "CodeMeaning",
+          unitCode
+        )
+        or unitCode
+      )
+
+    # Keep textual metadata even on Slicer builds where
+    # vtkCodedEntry is unavailable.
+    if quantityCode:
+      volumeNode.SetAttribute(
+        "SlicerDynamicPET.QuantityCode",
+        quantityCode
+      )
+
+    if quantityMeaning:
+      volumeNode.SetAttribute(
+        "SlicerDynamicPET.QuantityMeaning",
+        quantityMeaning
+      )
+
+    if unitCode:
+      volumeNode.SetAttribute(
+        "SlicerDynamicPET.UnitCode",
+        unitCode
+      )
+
+    if unitScheme:
+      volumeNode.SetAttribute(
+        "SlicerDynamicPET.UnitCodingScheme",
+        unitScheme
+      )
+
+    if unitMeaning:
+      volumeNode.SetAttribute(
+        "SlicerDynamicPET.UnitMeaning",
+        unitMeaning
+      )
+
+    # Also populate Slicer's quantitative voxel metadata.
+    if (
+      quantityCode
+      and
+      hasattr(
+        volumeNode,
+        "SetVoxelValueQuantity"
+      )
+    ):
+      quantity = self._makeCodedEntry(
+        quantityCode,
+        "99SDPET",
+        quantityMeaning
+      )
+
+      if quantity is not None:
+        volumeNode.SetVoxelValueQuantity(
+          quantity
+        )
+
+    if (
+      unitCode
+      and
+      hasattr(
+        volumeNode,
+        "SetVoxelValueUnits"
+      )
+    ):
+      units = self._makeCodedEntry(
+        unitCode,
+        unitScheme or "UCUM",
+        unitMeaning
+      )
+
+      if units is not None:
+        volumeNode.SetVoxelValueUnits(
+          units
+        )
+
+
+  def load(self, loadable):
+    """
+    Load a DICOM Parametric Map as a vtkMRMLScalarVolumeNode.
+
+    Pixel values are returned in real-world units and the
+    DICOM LPS geometry is converted explicitly to Slicer RAS.
+    """
+
+    volumeNode = None
+
+    try:
+      import numpy as np
+
+      hd = self._ensureHighdicom()
+
+      if not loadable.files:
+        raise RuntimeError(
+          "Parametric Map loadable has no DICOM file."
+        )
+
+      filePath = loadable.files[0]
+
+      # --------------------------------------------------------------
+      # Read PM using highdicom
+      # --------------------------------------------------------------
+
+      pm = hd.imread(
+          filePath
+      )
+
+      if (
+        str(pm.SOPClassUID)
+        != self.PARAMETRIC_MAP_SOP_CLASS_UID
+      ):
+        raise RuntimeError(
+          "Selected object is not a DICOM "
+          "Parametric Map Storage instance."
+        )
+
+      # --------------------------------------------------------------
+      # Recover real-world voxel values and spatial geometry
+      #
+      # highdicom Volume uses:
+      #   array axes = [K, J, I]
+      #   affine     = KJI -> DICOM LPS
+      # --------------------------------------------------------------
+
+      parametricVolume = pm.get_volume(
+        dtype=np.float32,
+        apply_real_world_transform=True
+      )
+
+      pixelArray = np.asarray(
+        parametricVolume.array,
+        dtype=np.float32
+      )
+
+      if pixelArray.ndim != 3:
+        raise RuntimeError(
+          "Expected a 3D scalar Parametric Map, "
+          f"but got shape {pixelArray.shape}."
+        )
+
+      kjiToLPS = np.asarray(
+        parametricVolume.affine,
+        dtype=np.float64
+      )
+
+      if kjiToLPS.shape != (4, 4):
+        raise RuntimeError(
+          "Invalid Parametric Map affine matrix."
+        )
+
+      # --------------------------------------------------------------
+      # Convert highdicom KJI indexing to Slicer IJK indexing.
+      #
+      # highdicom:
+      #   axis 0 -> K
+      #   axis 1 -> J
+      #   axis 2 -> I
+      #
+      # Slicer:
+      #   matrix column 0 -> I
+      #   matrix column 1 -> J
+      #   matrix column 2 -> K
+      # --------------------------------------------------------------
+
+      ijkToLPS = np.eye(
+        4,
+        dtype=np.float64
+      )
+
+      ijkToLPS[:3, 0] = \
+        kjiToLPS[:3, 2]
+
+      ijkToLPS[:3, 1] = \
+        kjiToLPS[:3, 1]
+
+      ijkToLPS[:3, 2] = \
+        kjiToLPS[:3, 0]
+
+      ijkToLPS[:3, 3] = \
+        kjiToLPS[:3, 3]
+
+      # DICOM patient coordinates are LPS.
+      # Slicer uses RAS.
+      lpsToRAS = np.array(
+        [
+          [-1.0,  0.0, 0.0, 0.0],
+          [ 0.0, -1.0, 0.0, 0.0],
+          [ 0.0,  0.0, 1.0, 0.0],
+          [ 0.0,  0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64
+      )
+
+      ijkToRASArray = (
+        lpsToRAS @ ijkToLPS
+      )
+
+      # --------------------------------------------------------------
+      # Create Slicer scalar volume
+      # --------------------------------------------------------------
+
+      seriesDescription = str(
+        getattr(
+          pm,
+          "SeriesDescription",
+          ""
+        )
+        or
+        "SlicerDynamicPET Parametric Map"
+      )
+
+      nodeName = (
+        slicer.mrmlScene.GenerateUniqueName(
+          seriesDescription
+        )
+      )
+
+      volumeNode = (
+        slicer.mrmlScene.AddNewNodeByClass(
+          "vtkMRMLScalarVolumeNode",
+          nodeName
+        )
+      )
+
+      slicer.util.updateVolumeFromArray(
+        volumeNode,
+        pixelArray
+      )
+
+      ijkToRAS = vtk.vtkMatrix4x4()
+
+      for row in range(4):
+        for column in range(4):
+          ijkToRAS.SetElement(
+            row,
+            column,
+            float(
+              ijkToRASArray[
+                row,
+                column
+              ]
+            )
+          )
+
+      volumeNode.SetIJKToRASMatrix(
+        ijkToRAS
+      )
+
+      # Match the protection used by Slicer's standard
+      # scalar-volume DICOM loader: keep IJK right-handed
+      # while preserving physical geometry.
+      if not slicer.vtkMRMLVolumeNode.IsIJKCoordinateSystemRightHanded(
+          ijkToRAS):
+
+        slicer.vtkMRMLVolumeNode.ReverseSliceOrder(
+          volumeNode.GetImageData(),
+          ijkToRAS
+        )
+
+        volumeNode.SetIJKToRASMatrix(
+          ijkToRAS
+        )
+
+      # --------------------------------------------------------------
+      # DICOM provenance
+      # --------------------------------------------------------------
+
+      volumeNode.SetAttribute(
+        "DICOM.instanceUIDs",
+        str(pm.SOPInstanceUID)
+      )
+
+      volumeNode.SetAttribute(
+        "DICOM.SeriesInstanceUID",
+        str(pm.SeriesInstanceUID)
+      )
+
+      volumeNode.SetAttribute(
+        "DICOM.StudyInstanceUID",
+        str(pm.StudyInstanceUID)
+      )
+
+      volumeNode.SetAttribute(
+        "DICOM.SOPClassUID",
+        str(pm.SOPClassUID)
+      )
+
+      if hasattr(
+          pm,
+          "FrameOfReferenceUID"):
+        volumeNode.SetAttribute(
+          "DICOM.FrameOfReferenceUID",
+          str(pm.FrameOfReferenceUID)
+        )
+
+      volumeNode.SetAttribute(
+        "SlicerDynamicPET.ResultType",
+        "ParametricMap"
+      )
+
+      volumeNode.SetAttribute(
+        "SlicerDynamicPET.ImportedFromDICOM",
+        "1"
+      )
+
+      derivationDescription = str(
+        getattr(
+          pm,
+          "DerivationDescription",
+          ""
+        )
+        or ""
+      )
+
+      if derivationDescription:
+        volumeNode.SetAttribute(
+          "SlicerDynamicPET.DerivationDescription",
+          derivationDescription
+        )
+
+      # Quantity and units from the PM Real World
+      # Value Mapping sequence.
+      self._setParametricMapQuantityMetadata(
+        volumeNode,
+        pm
+      )
+
+      # --------------------------------------------------------------
+      # Display
+      # --------------------------------------------------------------
+
+      volumeNode.CreateDefaultDisplayNodes()
+
+      displayNode = (
+        volumeNode.GetDisplayNode()
+      )
+
+      if displayNode:
+        displayNode.SetAutoWindowLevel(
+          True
+        )
+
+        displayNode.SetInterpolate(
+          True
+        )
+
+      # --------------------------------------------------------------
+      # Put it into the DICOM patient/study hierarchy.
+      #
+      # This uses the PM object's own patient/study DICOM
+      # metadata and therefore keeps it under the same study.
+      # --------------------------------------------------------------
+
+      self.addSeriesInSubjectHierarchy(
+        loadable,
+        volumeNode
+      )
+
+      # Make loaded PM visible as active volume.
+      appLogic = (
+        slicer.app.applicationLogic()
+      )
+
+      if appLogic:
+        selectionNode = (
+          appLogic.GetSelectionNode()
+        )
+
+        selectionNode.SetReferenceActiveVolumeID(
+          volumeNode.GetID()
+        )
+
+        appLogic.PropagateVolumeSelection()
+
+      logging.info(
+        "[dPET PM] Loaded Parametric Map "
+        f"'{seriesDescription}', "
+        f"shape={pixelArray.shape}, "
+        f"SOPInstanceUID={pm.SOPInstanceUID}"
+      )
+
+      return volumeNode
+
+    except Exception as e:
+
+      logging.error(
+        f"[dPET PM] Parametric Map load failed: {e}"
+      )
+
+      import traceback
+      traceback.print_exc()
+
+      if volumeNode is not None:
+        try:
+          slicer.mrmlScene.RemoveNode(
+            volumeNode
+          )
+        except Exception:
+          pass
+
+      return None
+
 
 #
 # dPETImporterPlugin
@@ -950,7 +1615,14 @@ class dPETImporterPlugin:
       slicer.modules.dicomPlugins
     except AttributeError:
       slicer.modules.dicomPlugins = {}
-    slicer.modules.dicomPlugins['dPETImporterPlugin'] = dPETImporterPluginClass
+
+    slicer.modules.dicomPlugins[
+      'dPETImporterPlugin'
+    ] = dPETImporterPluginClass
+
+    slicer.modules.dicomPlugins[
+      'dPETParametricMapPlugin'
+    ] = dPETParametricMapPluginClass
 
 #
 #
