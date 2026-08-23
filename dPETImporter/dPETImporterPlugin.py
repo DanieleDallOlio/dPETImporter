@@ -415,10 +415,13 @@ class dPETImporterPluginClass(DICOMPlugin):
 
     # Not BQML → must be SUV-like
     if units == "GML":
-      # SUV must have type or be inferable
+      # SlicerDynamicPET currently supports body-weight normalized SUV only.
       if not suvType:
         logging.warning("[dPET] Units=GML but SUVType missing; assuming BW")
         suvType = "BW"
+      if suvType not in ("BW", "SUVBW"):
+        logging.error(f"[dPET] Unsupported SUV type: {suvType}. Only SUVbw is supported.")
+        return False, None
       return True, "SUV"
 
     # Any other unit → unsupported
@@ -809,13 +812,22 @@ class dPETImporterPluginClass(DICOMPlugin):
     try:
       doSUV = settingsValue("DICOM/dPETImporterSUVEnabled", True, converter=toBool)
 
+      # Compute the physical Bq/mL -> SUVbw factor independently of whether
+      # voxel values are converted on load. This allows DynamicPET to move
+      # safely between SUVbw and activity concentration later without changing
+      # the stored image values.
+      suvbwFactor = compute_suvbw_for_start(mvNode)
+      factorValid = suvbwFactor is not None and suvbwFactor > 0
+
       sequenceSUV = None
-      if unitType == "BQML":
-        if doSUV and self._isDecayCorrectedToFirstFrameStart(mvNode):
-          sequenceSUV = compute_suvbw_for_start(mvNode)
+      if unitType == "BQML" and doSUV and factorValid:
+        sequenceSUV = suvbwFactor
 
       if unitType == "BQML" and doSUV and sequenceSUV is None:
         logging.warning("[dPET] SUV conversion disabled: series is not usable as decay-corrected-to-first-frame START.")
+
+      if unitType == "SUV" and not factorValid:
+        logging.warning("[dPET] SUVbw values loaded, but no validated inverse SUVbw factor is available; Bq/mL conversion will be disabled in DynamicPET.")
 
       for fi in range(nFrames):
         progressbar.value = fi
@@ -852,17 +864,26 @@ class dPETImporterPluginClass(DICOMPlugin):
             ok = self._multiplyVolumeByConstant(seqDataNode, sequenceSUV)
             if ok:
               seqDataNode.SetAttribute('dPET.ValueType', 'SUVbw')
-              seqDataNode.SetAttribute('dPET.SUVbwFactor', str(sequenceSUV))
-              volumeSequenceNode.SetAttribute(f'dPET.Frame.{idx}.SUVbwFactor', str(sequenceSUV))
               sequenceValueType = "SUVbw"
             else:
               seqDataNode.SetAttribute('dPET.ValueType', 'BQML')
           else:
             seqDataNode.SetAttribute('dPET.ValueType', 'BQML')
         else:
+          # DICOM is already SUVbw. Do not rescale the voxel values.
           seqDataNode.SetAttribute('dPET.ValueType', 'SUVbw')
-          seqDataNode.SetAttribute('dPET.SUVbwFactor', '1.0')
-          volumeSequenceNode.SetAttribute(f'dPET.Frame.{idx}.SUVbwFactor', '1.0')
+
+        # Preserve the physical conversion factor even when the stored values
+        # remain in BQML or arrived already as SUVbw. Never use 1.0 as a fake
+        # inverse conversion factor.
+        if factorValid:
+          seqDataNode.SetAttribute('dPET.SUVbwFactor', str(suvbwFactor))
+          seqDataNode.SetAttribute('dPET.SUVbwFactorValid', '1')
+          volumeSequenceNode.SetAttribute(f'dPET.Frame.{idx}.SUVbwFactor', str(suvbwFactor))
+          volumeSequenceNode.SetAttribute(f'dPET.Frame.{idx}.SUVbwFactorValid', '1')
+        else:
+          seqDataNode.SetAttribute('dPET.SUVbwFactorValid', '0')
+          volumeSequenceNode.SetAttribute(f'dPET.Frame.{idx}.SUVbwFactorValid', '0')
 
         # cleanup temporary nodes created by scalarVolumePlugin.load
         if frameNode.GetDisplayNode():
@@ -875,10 +896,11 @@ class dPETImporterPluginClass(DICOMPlugin):
       # create browser and show sequence
       volumeSequenceNode.SetAttribute('dPET.ValueType', sequenceValueType)
 
-      if sequenceSUV is not None:
-        volumeSequenceNode.SetAttribute("dPET.SUVbwFactor", str(sequenceSUV))
-      elif unitType != "BQML":
-        volumeSequenceNode.SetAttribute("dPET.SUVbwFactor", "1.0")
+      if factorValid:
+        volumeSequenceNode.SetAttribute("dPET.SUVbwFactor", str(suvbwFactor))
+        volumeSequenceNode.SetAttribute("dPET.SUVbwFactorValid", "1")
+      else:
+        volumeSequenceNode.SetAttribute("dPET.SUVbwFactorValid", "0")
 
       browser = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLSequenceBrowserNode', slicer.mrmlScene.GenerateUniqueName(baseName + " browser"))
       if slicer.modules.sequences.widgetRepresentation():
@@ -893,6 +915,11 @@ class dPETImporterPluginClass(DICOMPlugin):
       if proxyVol:
         proxyVol.SetAttribute("dPETImporter.LoadedBy", "dPETImporterPlugin")
         proxyVol.SetAttribute('dPET.ValueType', sequenceValueType)
+        if factorValid:
+          proxyVol.SetAttribute('dPET.SUVbwFactor', str(suvbwFactor))
+          proxyVol.SetAttribute('dPET.SUVbwFactorValid', '1')
+        else:
+          proxyVol.SetAttribute('dPET.SUVbwFactorValid', '0')
         self._setProxyQuantityUnits(proxyVol, sequenceValueType)
 
         disp = proxyVol.GetDisplayNode() or proxyVol.CreateDefaultDisplayNodes()
