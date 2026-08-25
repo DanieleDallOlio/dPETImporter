@@ -1139,6 +1139,25 @@ class dPETImporterPluginClass(DICOMPlugin):
         appLogic.PropagateVolumeSelection()
       # add to subject hierarchy
       self.addSeriesInSubjectHierarchy(loadable, proxyVol if proxyVol else volumeSequenceNode)
+
+      # The proxy relationship is now fully established. Disable automatic
+      # proxy renaming only at this final stage (equivalent to unchecking
+      # "Rename" manually in the Sequences module after loading). This does
+      # not affect playback or synchronization; it only keeps the proxy name
+      # stable while the selected item changes.
+      if proxyVol:
+        browser.SetOverwriteProxyName(volumeSequenceNode, False)
+        proxyVol.SetName(baseName)
+        try:
+          shNode = slicer.vtkMRMLSubjectHierarchyNode.GetSubjectHierarchyNode(
+              slicer.mrmlScene)
+          proxyItemID = shNode.GetItemByDataNode(proxyVol) if shNode else 0
+          if (shNode and proxyItemID !=
+              slicer.vtkMRMLSubjectHierarchyNode.INVALID_ITEM_ID):
+            shNode.SetItemName(proxyItemID, baseName)
+        except Exception:
+          pass
+
       return volumeSequenceNode
     except Exception as e:
       logging.error(f"dPET import failed: {e}")
