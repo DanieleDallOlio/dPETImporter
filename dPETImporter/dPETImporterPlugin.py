@@ -5,7 +5,7 @@ import DICOMLib
 from DICOMLib import DICOMPlugin, DICOMLoadable
 from slicer.util import settingsValue, toBool
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 
 #
 # This is the plugin to efficiently handle translation of DICOM objects
@@ -28,12 +28,24 @@ def _parse_dicom_datetime(date_str, time_str):
 def _parse_dicom_datetime_value(dt_str):
   if not dt_str:
     return None
-  for fmt in ("%Y%m%d%H%M%S.%f", "%Y%m%d%H%M%S"):
-    try:
-      return datetime.strptime(dt_str, fmt)
-    except Exception:
-      pass
-  return None
+  text = str(dt_str).strip()
+  # DICOM DT may contain fractional seconds and an optional UTC offset.
+  # For the injection-to-acquisition interval we need the local wall-clock
+  # value; acquisition DT in many PET objects does not carry an offset, so
+  # strip the optional suffix consistently rather than mixing aware/naive DTs.
+  m = re.match(r"^(\d{14})(?:\.(\d+))?(?:[+-]\d{4})?$", text)
+  if not m:
+    return None
+  base = m.group(1)
+  frac = m.group(2)
+  try:
+    dt = datetime.strptime(base, "%Y%m%d%H%M%S")
+    if frac:
+      microseconds = int((frac[:6]).ljust(6, '0'))
+      dt = dt.replace(microsecond=microseconds)
+    return dt
+  except Exception:
+    return None
 
 
 def compute_suvbw_for_start(mvNode):
@@ -187,7 +199,8 @@ class dPETImporterPluginClass(DICOMPlugin):
     """
     Read nested Radiopharmaceutical Information Sequence (0054,0016)
     using pydicom, return dict with keys:
-      RadionuclideHalfLife, RadionuclideTotalDose, RadiopharmaceuticalStartTime
+      RadionuclideHalfLife, RadionuclideTotalDose,
+      RadiopharmaceuticalStartDateTime, RadiopharmaceuticalStartTime
     Returns {} if not found.
     """
     try:
@@ -217,6 +230,7 @@ class dPETImporterPluginClass(DICOMPlugin):
         return ""
       out["RadionuclideHalfLife"] = get_item_str((0x0018, 0x1075))
       out["RadionuclideTotalDose"] = get_item_str((0x0018, 0x1074))
+      out["RadiopharmaceuticalStartDateTime"] = get_item_str((0x0018, 0x1078))
       out["RadiopharmaceuticalStartTime"] = get_item_str((0x0018, 0x1072))
 
       out = {k: v for k, v in out.items() if v not in ("", None)}
@@ -226,6 +240,39 @@ class dPETImporterPluginClass(DICOMPlugin):
       import traceback
       traceback.print_exc()
       return {}
+
+
+  def _resolveRadiopharmaceuticalStartDateTime(self, mvNode, firstFrameDt):
+    """
+    Resolve the best available administration datetime while preserving source.
+
+    Priority:
+      1. DICOM Radiopharmaceutical Start DateTime (0018,1078)
+      2. DICOM Radiopharmaceutical Start Time (0018,1072) combined with
+         the first-frame calendar date (with +/- one-day rollover candidates)
+
+    The resolved datetime is metadata only.  DynamicPET applies a separate,
+    conservative rule before using it as a kinetic time offset.
+    """
+    exact = mvNode.GetAttribute('RadiopharmaceuticalStartDateTime') or ''
+    exactDt = _parse_dicom_datetime_value(exact)
+    if exactDt is not None:
+      return exactDt, 'DICOM.0018,1078'
+
+    startTime = mvNode.GetAttribute('RadiopharmaceuticalStartTime') or ''
+    if not startTime or firstFrameDt is None:
+      return None, 'Unavailable'
+
+    # Parse TM using the first-frame date, then consider midnight rollover.
+    baseDate = firstFrameDt.strftime('%Y%m%d')
+    candidate = _parse_dicom_datetime(baseDate, startTime)
+    if candidate is None:
+      return None, 'Unavailable'
+
+    candidates = [candidate - timedelta(days=1), candidate, candidate + timedelta(days=1)]
+    # Choose the closest calendar interpretation to the first PET frame.
+    resolved = min(candidates, key=lambda dt: abs((firstFrameDt - dt).total_seconds()))
+    return resolved, 'DICOM.0018,1072+frame-date'
 
 
   def examine(self,fileLists):
@@ -599,12 +646,14 @@ class dPETImporterPluginClass(DICOMPlugin):
 
       setAttrIfFound('RadionuclideHalfLife', "0018,1075")      # Radionuclide Half Life
       setAttrIfFound('RadionuclideTotalDose', "0018,1074")     # Radionuclide Total Dose
-      setAttrIfFound('RadiopharmaceuticalStartTime', "0018,1072")  # may exist as time-only
+      setAttrIfFound('RadiopharmaceuticalStartDateTime', "0018,1078")  # DICOM DT, preferred
+      setAttrIfFound('RadiopharmaceuticalStartTime', "0018,1072")      # DICOM TM fallback
 
       needNested = (
         not mvNode.GetAttribute('RadionuclideHalfLife') or
         not mvNode.GetAttribute('RadionuclideTotalDose') or
-        not mvNode.GetAttribute('RadiopharmaceuticalStartTime')
+        (not mvNode.GetAttribute('RadiopharmaceuticalStartDateTime') and
+         not mvNode.GetAttribute('RadiopharmaceuticalStartTime'))
       )
       if needNested:
         nested = self._getRadiopharmNested(firstFrameFile)
@@ -616,10 +665,22 @@ class dPETImporterPluginClass(DICOMPlugin):
       setAttrIfFound('SeriesDate', "0008,0021")
       setAttrIfFound('SeriesTime', "0008,0031")
 
-      seriesDate = mvNode.GetAttribute('SeriesDate') or mvNode.GetAttribute('StudyDate') or ''
-      startTime = mvNode.GetAttribute('RadiopharmaceuticalStartTime') or ''
-      if seriesDate and startTime:
-        mvNode.SetAttribute('RadionuclideStartDateTime', seriesDate + startTime)
+      resolvedStartDt, startSource = self._resolveRadiopharmaceuticalStartDateTime(
+        mvNode, firstFrameDt)
+      if resolvedStartDt is not None:
+        resolvedText = resolvedStartDt.strftime("%Y%m%d%H%M%S")
+        # Keep the exact DICOM attribute separate when it exists, while
+        # retaining this backwards-compatible normalized value for consumers.
+        mvNode.SetAttribute('RadionuclideStartDateTime', resolvedText)
+        mvNode.SetAttribute('dPET.InjectionDateTimeSource', startSource)
+
+        if firstFrameDt is not None:
+          rawOffsetSec = (firstFrameDt - resolvedStartDt).total_seconds()
+          mvNode.SetAttribute(
+            'dPET.InjectionToAcquisitionOffsetSec',
+            str(float(rawOffsetSec)))
+      else:
+        mvNode.SetAttribute('dPET.InjectionDateTimeSource', 'Unavailable')
 
       multivolumes.append(mvNode)
 
@@ -915,6 +976,22 @@ class dPETImporterPluginClass(DICOMPlugin):
       if proxyVol:
         proxyVol.SetAttribute("dPETImporter.LoadedBy", "dPETImporterPlugin")
         proxyVol.SetAttribute('dPET.ValueType', sequenceValueType)
+
+        # Preserve injection/acquisition provenance on the proxy too.  The
+        # sequence already receives all mvNode attributes above, but DynamicPET
+        # and other modules frequently inspect the proxy scalar volume directly.
+        for attrName in (
+          'RadiopharmaceuticalStartDateTime',
+          'RadiopharmaceuticalStartTime',
+          'RadionuclideStartDateTime',
+          'RadionuclideTotalDose',
+          'RadionuclideHalfLife',
+          'dPET.FirstFrameAcquisitionDateTime',
+          'dPET.InjectionDateTimeSource',
+          'dPET.InjectionToAcquisitionOffsetSec'):
+          attrValue = volumeSequenceNode.GetAttribute(attrName)
+          if attrValue not in (None, ''):
+            proxyVol.SetAttribute(attrName, attrValue)
         if factorValid:
           proxyVol.SetAttribute('dPET.SUVbwFactor', str(suvbwFactor))
           proxyVol.SetAttribute('dPET.SUVbwFactorValid', '1')
