@@ -813,6 +813,111 @@ class dPETImporterPluginClass(DICOMPlugin):
     volumeNode.SetVoxelValueUnits(units)
     volumeNode.SetAttribute("dPET.ValueType", valueType)
 
+  @staticmethod
+  def _parseDICOMVector(value, expectedLength=None):
+    """Parse a DICOM multi-value string into floats without re-reading files."""
+    if value in (None, ""):
+      return None
+    try:
+      if isinstance(value, (list, tuple)):
+        values = [float(item) for item in value]
+      else:
+        values = [float(item) for item in str(value).split('\\') if item != '']
+      if expectedLength is not None and len(values) != expectedLength:
+        return None
+      return values
+    except Exception:
+      return None
+
+  def _buildDynamicRTExportProvenance(self, files, nFrames, filesPerFrame):
+    """Build compact frame-wise DICOM provenance from the indexed DICOM DB.
+
+    No source file is opened here. The DICOM database has already indexed the
+    tags used by dPETImporter, so retaining them while loading adds negligible
+    work compared with creating the PET volumes themselves.
+
+    One temporal frame owns one or more source SOP instances:
+      * 3D-per-frame: one instance;
+      * 2D-slices-per-frame: one instance per spatial slice.
+    """
+    if not files or nFrames < 1 or filesPerFrame < 1:
+      return None
+
+    db = slicer.dicomDatabase
+    firstFile = files[0]
+
+    def value(filePath, tag):
+      result = db.fileValue(filePath, tag)
+      return str(result) if result not in (None, "") else ""
+
+    patientStudyTags = {
+      'SpecificCharacterSet': '0008,0005',
+      'PatientName': '0010,0010',
+      'PatientID': '0010,0020',
+      'PatientBirthDate': '0010,0030',
+      'PatientSex': '0010,0040',
+      'PatientAge': '0010,1010',
+      'PatientSize': '0010,1020',
+      'PatientWeight': '0010,1030',
+      'StudyDate': '0008,0020',
+      'StudyTime': '0008,0030',
+      'AccessionNumber': '0008,0050',
+      'StudyID': '0020,0010',
+      'ReferringPhysicianName': '0008,0090',
+      'PerformingPhysicianName': '0008,1050',
+      'OperatorsName': '0008,1070',
+      'InstitutionName': '0008,0080',
+      'InstitutionAddress': '0008,0081',
+    }
+
+    provenance = {
+      'schemaVersion': 1,
+      'studyInstanceUID': value(firstFile, '0020,000D'),
+      'seriesInstanceUID': value(firstFile, '0020,000E'),
+      'frameOfReferenceUID': value(firstFile, '0020,0052'),
+      'patientStudy': {},
+      'frames': [],
+    }
+    for keyword, tag in patientStudyTags.items():
+      tagValue = value(firstFile, tag)
+      if tagValue:
+        provenance['patientStudy'][keyword] = tagValue
+
+    for frameIndex in range(nFrames):
+      frameFiles = files[frameIndex * filesPerFrame:(frameIndex + 1) * filesPerFrame]
+      instances = []
+      for filePath in frameFiles:
+        sopInstanceUID = value(filePath, '0008,0018')
+        sopClassUID = value(filePath, '0008,0016')
+        if not sopInstanceUID or not sopClassUID:
+          # A frame without stable DICOM identity is not useful provenance.
+          return None
+        instance = {
+          'sopInstanceUID': sopInstanceUID,
+          'sopClassUID': sopClassUID,
+        }
+        position = self._parseDICOMVector(value(filePath, '0020,0032'), 3)
+        orientation = self._parseDICOMVector(value(filePath, '0020,0037'), 6)
+        if position is not None:
+          instance['imagePositionPatient'] = position
+        if orientation is not None:
+          instance['imageOrientationPatient'] = orientation
+        instanceNumber = value(filePath, '0020,0013')
+        if instanceNumber:
+          instance['instanceNumber'] = instanceNumber
+        instances.append(instance)
+
+      provenance['frames'].append({
+        'index': frameIndex,
+        'instances': instances,
+      })
+
+    if (not provenance['studyInstanceUID']
+        or not provenance['seriesInstanceUID']
+        or not provenance['frameOfReferenceUID']):
+      return None
+    return provenance
+
   def load(self,loadable):
     """Load as Volume Sequence (only sequence is supported in this minimal plugin)"""
     try:
@@ -841,6 +946,29 @@ class dPETImporterPluginClass(DICOMPlugin):
     volumeSequenceNode.SetAttribute("dPETImporter.Source", "DICOM") # optional
     for attr in mvNode.GetAttributeNames():
       volumeSequenceNode.SetAttribute(attr, mvNode.GetAttribute(attr))
+
+    # Persist all DICOM identity needed for later Dynamic RTSTRUCT export.
+    # This is deliberately captured while dPETImporter already has the indexed
+    # source series available, so normal export never needs to reopen DICOM.
+    dynamicRTProvenance = self._buildDynamicRTExportProvenance(
+      files, nFrames, filesPerFrame)
+    if dynamicRTProvenance is not None:
+      provenanceJson = json.dumps(
+        dynamicRTProvenance, separators=(',', ':'), ensure_ascii=False)
+      volumeSequenceNode.SetAttribute('dPET.DICOM.FrameReferences', provenanceJson)
+      volumeSequenceNode.SetAttribute(
+        'dPET.DICOM.StudyInstanceUID', dynamicRTProvenance['studyInstanceUID'])
+      volumeSequenceNode.SetAttribute(
+        'dPET.DICOM.SeriesInstanceUID', dynamicRTProvenance['seriesInstanceUID'])
+      frameOfReferenceUID = dynamicRTProvenance.get('frameOfReferenceUID') or ''
+      if frameOfReferenceUID:
+        volumeSequenceNode.SetAttribute(
+          'dPET.DICOM.FrameOfReferenceUID', frameOfReferenceUID)
+      volumeSequenceNode.SetAttribute('dPET.DICOM.ProvenanceSchemaVersion', '1')
+    else:
+      logging.warning(
+        '[dPET] Could not persist complete Dynamic RTSTRUCT DICOM provenance; '
+        'export can still fall back to MRML/DICOM database/source metadata.')
 
     try:
       frame_times = json.loads(mvNode.GetAttribute('dPET.FrameTimes') or '[]')
