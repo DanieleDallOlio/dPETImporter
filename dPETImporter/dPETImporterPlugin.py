@@ -335,6 +335,20 @@ class dPETImporterPluginClass(DICOMPlugin):
     except Exception:
       return ""
 
+  def _isPETImageFile(self, filePath):
+    """Return True only for DICOM objects whose Modality (0008,0060) is PT.
+
+    dPETImporter is an image importer. Derived DICOM objects that can coexist
+    with PET series in the same study (for example Real World Value Mapping,
+    RTSTRUCT, Parametric Map, CT, etc.) must be ignored before any dynamic-PET
+    grouping or PET-specific metadata parsing is attempted.
+    """
+    return self._fileValue(filePath, self.tags['modality']).strip().upper() == 'PT'
+
+  def _petImageFiles(self, files):
+    """Silently remove non-PET DICOM objects from an examine/load candidate."""
+    return [filePath for filePath in (files or []) if self._isPETImageFile(filePath)]
+
   def _acquisitionDateTimeForFile(self, filePath):
     """Return (datetime, source) for the real acquisition start of one PET image."""
     acqDateTime = self._fileValue(filePath, "0008,002A")
@@ -729,12 +743,15 @@ class dPETImporterPluginClass(DICOMPlugin):
     allfiles = []
     lastFiles = []
     for files in fileLists:
-      lastFiles = files
+      petFiles = self._petImageFiles(files)
+      if not petFiles:
+        continue
+      lastFiles = petFiles
       if dynamicEnabled:
-        dynamicLoadables += self.examineFiles(files)
+        dynamicLoadables += self.examineFiles(petFiles)
       if staticEnabled:
-        staticLoadables += self.examineStaticFiles(files)
-      allfiles += files
+        staticLoadables += self.examineStaticFiles(petFiles)
+      allfiles += petFiles
 
     if dynamicEnabled and (not dynamicLoadables) and lastFiles and len(allfiles) > len(lastFiles):
       dynamicLoadables += self.examineFilesMultiseries(allfiles)
@@ -797,6 +814,9 @@ class dPETImporterPluginClass(DICOMPlugin):
     return name, tooltip
 
   def examineFilesMultiseries(self,files):
+    files = self._petImageFiles(files)
+    if not files:
+      return []
     mvNodes = self.initMultiVolumes(files,prescribedTags=['SeriesTime','AcquisitionTime'])
     loadables = []
     for mvNode in mvNodes:
@@ -816,6 +836,9 @@ class dPETImporterPluginClass(DICOMPlugin):
     return loadables
 
   def examineFiles(self,files):
+    files = self._petImageFiles(files)
+    if not files:
+      return []
     subseriesLists = {}
     for f in files:
       sid = slicer.dicomDatabase.fileValue(f, self.tags['seriesInstanceUID']) or "Unknown"
@@ -913,6 +936,9 @@ class dPETImporterPluginClass(DICOMPlugin):
     return False, None
 
   def initMultiVolumes(self, files, prescribedTags=None):
+    files = self._petImageFiles(files)
+    if not files:
+      return []
     tag2ValueFileList = {}
     multivolumes = []
     consideredTags = list(self.multiVolumeTags.keys()) if prescribedTags is None else list(prescribedTags)
@@ -1187,34 +1213,107 @@ class dPETImporterPluginClass(DICOMPlugin):
     return True
 
   def setPetDicomLUT(self, volumeNode):
+    """Apply the standard Slicer PET display to a loaded PET volume.
+
+    The display is made deterministic for both static PET and dynamic PET
+    proxies:
+      * use the DICOM-standard PET procedural color scale;
+      * initialize a valid W/L from the final voxel scalar range;
+      * leave Auto Window/Level ON;
+      * enable interpolation.
+
+    Initializing W/L before turning Auto back on avoids a stale display state
+    inherited from the generic scalar-volume loader while preserving Slicer's
+    normal automatic W/L behavior afterwards.
+    """
     if not volumeNode:
       return False
 
-    # Ensure display node exists
     displayNode = volumeNode.GetDisplayNode()
     if displayNode is None:
       volumeNode.CreateDefaultDisplayNodes()
       displayNode = volumeNode.GetDisplayNode()
     if displayNode is None:
+      logging.error("[dPET] Could not create PET volume display node.")
       return False
 
-    # Robustly get PET-DICOM color node
+    # Prefer Slicer's built-in PET-DICOM procedural color node.
     petColorNode = slicer.mrmlScene.GetFirstNodeByName("PET-DICOM")
-    if petColorNode is None:
-      # If name lookup fails, get the singleton ID for the PETDICOM procedural node
-      petColorNodeID = vtk.vtkMRMLColorLogic.GetPETColorNodeID(
-        vtk.vtkMRMLPETProceduralColorNode.PETDICOM
-      )
-      petColorNode = slicer.mrmlScene.GetNodeByID(petColorNodeID)
 
+    # Be defensive across Slicer builds where the singleton node may not yet
+    # have been instantiated in the scene.
     if petColorNode is None:
-      logging.error("[dPET] PET-DICOM color node not found in scene.")
-      return False
+      try:
+        colorLogicClass = getattr(slicer, "vtkMRMLColorLogic", None)
+        petClass = getattr(slicer, "vtkMRMLPETProceduralColorNode", None)
+        if colorLogicClass is not None and petClass is not None:
+          petColorNodeID = colorLogicClass.GetPETColorNodeID(petClass.PETDICOM)
+          if petColorNodeID:
+            petColorNode = slicer.mrmlScene.GetNodeByID(petColorNodeID)
+      except Exception:
+        petColorNode = None
 
-    displayNode.SetAndObserveColorNodeID(petColorNode.GetID())
+    # Final fallback: create a PET procedural color node explicitly and set it
+    # to the DICOM-standard PET palette.
+    if petColorNode is None:
+      try:
+        petColorNode = slicer.mrmlScene.AddNewNodeByClass(
+          "vtkMRMLPETProceduralColorNode", "PET-DICOM")
+        if hasattr(petColorNode, "SetTypeToDICOM"):
+          petColorNode.SetTypeToDICOM()
+        elif hasattr(petColorNode, "SetType"):
+          petClass = getattr(slicer, "vtkMRMLPETProceduralColorNode", None)
+          if petClass is not None:
+            petColorNode.SetType(petClass.PETDICOM)
+      except Exception as error:
+        logging.error(f"[dPET] Could not create PET-DICOM color scale: {error}")
+        petColorNode = None
+
+    if petColorNode is not None:
+      displayNode.SetAndObserveColorNodeID(petColorNode.GetID())
+    else:
+      logging.error("[dPET] PET-DICOM color node could not be resolved.")
+
+    imageData = volumeNode.GetImageData()
+    if imageData is not None:
+      try:
+        scalarMin, scalarMax = imageData.GetScalarRange()
+        scalarMin = float(scalarMin)
+        scalarMax = float(scalarMax)
+        if scalarMax > scalarMin:
+          # Seed a valid display range first. SetWindowLevelMinMax does not
+          # represent the desired final state; Auto W/L is explicitly turned
+          # back on immediately afterwards.
+          displayNode.AutoWindowLevelOff()
+          displayNode.SetWindowLevelMinMax(scalarMin, scalarMax)
+      except Exception as error:
+        logging.warning(f"[dPET] PET scalar-range W/L initialization failed: {error}")
+
+    # Leave the node explicitly in automatic W/L mode. Use the convenience
+    # On() methods because they also make the intended MRML state unambiguous.
+    displayNode.AutoWindowLevelOn()
+    displayNode.InterpolateOn()
+
+    # Trigger the display pipeline after the final image values and color node
+    # are both in place.
+    if imageData is not None:
+      imageData.Modified()
     displayNode.Modified()
     volumeNode.Modified()
-    return True
+
+    # Store simple diagnostics to make runtime verification easy.
+    volumeNode.SetAttribute(
+      "dPET.Display.AutoWindowLevel",
+      "1" if displayNode.GetAutoWindowLevel() else "0")
+    volumeNode.SetAttribute(
+      "dPET.Display.ColorNode",
+      str(displayNode.GetColorNodeID() or ""))
+
+    return bool(
+      displayNode.GetAutoWindowLevel()
+      and petColorNode is not None
+      and displayNode.GetColorNodeID() == petColorNode.GetID())
+
 
   def _setProxyQuantityUnits(self, volumeNode, valueType):
     if volumeNode is None:
@@ -1440,6 +1539,10 @@ class dPETImporterPluginClass(DICOMPlugin):
 
   def load(self,loadable):
     """Load dynamic PET as sequence or optional static PET as scalar volume."""
+    candidateFiles = list(getattr(loadable, 'files', []) or [])
+    if not candidateFiles or any(not self._isPETImageFile(path) for path in candidateFiles):
+      return None
+
     if getattr(loadable, 'dPETLoadMode', None) == 'static':
       return self._loadStaticPET(loadable)
 
@@ -1662,8 +1765,6 @@ class dPETImporterPluginClass(DICOMPlugin):
         disp = proxyVol.GetDisplayNode()
         if disp:
           self.setPetDicomLUT(proxyVol)
-          disp.SetAutoWindowLevel(True)
-          disp.SetInterpolate(True)
         appLogic = slicer.app.applicationLogic()
         selNode = appLogic.GetSelectionNode()
         selNode.SetReferenceActiveVolumeID(proxyVol.GetID())
