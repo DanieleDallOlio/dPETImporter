@@ -9,8 +9,8 @@ class dPETImporter:
       "Daniele Dall'Olio (University of Bologna)"
     ]
     parent.helpText = (
-      "DICOM plugin to import dynamic PET datasets "
-      "and SlicerDynamicPET Parametric Maps."
+      "DICOM plugin to import dynamic PET datasets, optional static PET "
+      "datasets with kinetic metadata, and SlicerDynamicPET Parametric Maps."
     )
     parent.hidden = True
 

@@ -48,36 +48,40 @@ def _parse_dicom_datetime_value(dt_str):
     return None
 
 
-def compute_suvbw_for_start(mvNode):
+def compute_suvbw_factor(mvNode):
   """
-  Compute a single SUVbw factor for the whole dynamic sequence.
+  Compute the Bq/mL -> SUVbw factor for the DICOM decay convention.
 
-  Enforced convention:
-    - DecayCorrection must be START
-    - START is taken as the acquisition datetime of the first frame
+  Supported conventions:
+    START: dose is decayed from administration to the first acquisition start.
+    ADMIN: administered dose is used directly; administration datetime is NOT
+           used for any back/forward extrapolation.
 
-  Returns float or None.
+  NONE/unknown are intentionally unsupported for quantitative Multi-timepoint
+  use and return None.
   """
   try:
+    half_life = float(mvNode.GetAttribute('RadionuclideHalfLife') or 0.0)
+    weight = float(mvNode.GetAttribute('PatientWeight') or 0.0)
+    totalDose = float(mvNode.GetAttribute('RadionuclideTotalDose') or 0.0)
+    decayCorrection = (mvNode.GetAttribute('DecayCorrection') or '').upper()
+    if weight <= 0.0 or totalDose <= 0.0:
+      return None
+    dose_kbq = totalDose * 0.001
+    if dose_kbq <= 0.0:
+      return None
+
+    if decayCorrection == 'ADMIN':
+      # ADMIN-referenced image activity is normalized by the administered
+      # (non-decayed) dose.  No administration datetime is used here.
+      return float(weight / dose_kbq)
+
+    if decayCorrection != 'START':
+      return None
+
     rstart = mvNode.GetAttribute('RadionuclideStartDateTime')
     first_frame_dt = mvNode.GetAttribute('dPET.FirstFrameAcquisitionDateTime')
-
-    half_life = float(mvNode.GetAttribute('RadionuclideHalfLife'))
-    weight = float(mvNode.GetAttribute('PatientWeight'))
-    totalDose = float(mvNode.GetAttribute('RadionuclideTotalDose'))
-
-    decayCorrection = (mvNode.GetAttribute('DecayCorrection') or '').upper()
-    correctedImage = (mvNode.GetAttribute('CorrectedImage') or mvNode.GetAttribute('correctedImage') or '').upper()
-
-    if not (rstart and first_frame_dt and half_life > 0 and weight > 0 and totalDose > 0):
-      return None
-
-    # Require START
-    if decayCorrection != "START":
-      return None
-
-    # Conservative check for corrected image
-    if not (("ATTN" in correctedImage) and ("DECY" in correctedImage or "DECAY" in correctedImage)):
+    if not (rstart and first_frame_dt and half_life > 0.0):
       return None
 
     start_dt = _parse_dicom_datetime_value(rstart)
@@ -86,19 +90,19 @@ def compute_suvbw_for_start(mvNode):
       return None
 
     decay_seconds = (ref_dt - start_dt).total_seconds()
-
-    dose_kbq = totalDose * 0.001
-    if dose_kbq <= 0:
-      return None
-
     decayedDose = dose_kbq * 2 ** (-decay_seconds / half_life)
-    if decayedDose <= 0:
+    if decayedDose <= 0.0:
       return None
-
-    suvbw = weight / decayedDose
-    return float(suvbw)
+    return float(weight / decayedDose)
   except Exception:
     return None
+
+
+def compute_suvbw_for_start(mvNode):
+  """Backward-compatible wrapper retained for external callers."""
+  if (mvNode.GetAttribute('DecayCorrection') or '').upper() != 'START':
+    return None
+  return compute_suvbw_factor(mvNode)
 
 
 
@@ -120,6 +124,17 @@ class dPETImporterPluginClass(DICOMPlugin):
     self.tags['instanceNumber'] = "0020,0013"
     # self.tags['repetitionTime'] = "0018,0080"
     self.tags['modality'] = "0008,0060"
+    self.tags['studyInstanceUID'] = "0020,000D"
+    self.tags['frameOfReferenceUID'] = "0020,0052"
+    self.tags['sopClassUID'] = "0008,0016"
+    self.tags['seriesType'] = "0054,1000"
+    self.tags['acquisitionDate'] = "0008,0022"
+    self.tags['acquisitionDateTime'] = "0008,002A"
+    self.tags['actualFrameDuration'] = "0018,1242"
+    self.tags['units'] = "0054,1001"
+    self.tags['suvType'] = "0054,1006"
+    self.tags['decayCorrection'] = "0054,1102"
+    self.tags['correctedImage'] = "0028,0051"
 
     # tags used to identify multivolumes
     self.multiVolumeTags = {
@@ -152,6 +167,20 @@ class dPETImporterPluginClass(DICOMPlugin):
     panel.registerProperty(
       "DICOM/dPETImporterEnabled",
       enabledCheckBox,
+      "checked",
+      str(qt.SIGNAL("toggled(bool)"))
+    )
+    staticCheckBox = qt.QCheckBox()
+    staticCheckBox.toolTip = (
+      "If enabled, STATIC and WHOLE BODY PET series are also offered as an "
+      "optional metadata-preserving loadable for SlicerDynamicPET kinetic analysis. "
+      "This alternative remains unchecked by default so specialized PET/SUV "
+      "loaders can remain the preferred choice.")
+    staticCheckBox.checked = True
+    formLayout.addRow("Offer Static PET kinetic loader:", staticCheckBox)
+    panel.registerProperty(
+      "DICOM/dPETImporterStaticEnabled",
+      staticCheckBox,
       "checked",
       str(qt.SIGNAL("toggled(bool)"))
     )
@@ -232,6 +261,24 @@ class dPETImporterPluginClass(DICOMPlugin):
       out["RadionuclideTotalDose"] = get_item_str((0x0018, 0x1074))
       out["RadiopharmaceuticalStartDateTime"] = get_item_str((0x0018, 0x1078))
       out["RadiopharmaceuticalStartTime"] = get_item_str((0x0018, 0x1072))
+      out["RadiopharmaceuticalName"] = get_item_str((0x0018, 0x0031))
+
+      def get_code_sequence(tag):
+        if tag not in item:
+          return ""
+        seq_value = getattr(item[tag], "value", None)
+        if not seq_value or len(seq_value) == 0:
+          return ""
+        code = seq_value[0]
+        cv = str(getattr(code, "CodeValue", "") or "")
+        csd = str(getattr(code, "CodingSchemeDesignator", "") or "")
+        cm = str(getattr(code, "CodeMeaning", "") or "")
+        if not (cv or csd or cm):
+          return ""
+        return "|".join((cv, csd, cm))
+
+      out["RadionuclideCode"] = get_code_sequence((0x0054, 0x0300))
+      out["RadiopharmaceuticalCode"] = get_code_sequence((0x0054, 0x0304))
 
       out = {k: v for k, v in out.items() if v not in ("", None)}
       return out
@@ -275,21 +322,424 @@ class dPETImporterPluginClass(DICOMPlugin):
     return resolved, 'DICOM.0018,1072+frame-date'
 
 
+  @staticmethod
+  def _formatDicomDateTime(dt):
+    if dt is None:
+      return ""
+    return dt.strftime("%Y%m%d%H%M%S.%f").rstrip('0').rstrip('.')
+
+  def _fileValue(self, filePath, tag):
+    try:
+      value = slicer.dicomDatabase.fileValue(filePath, tag)
+      return "" if value in (None, "") else str(value)
+    except Exception:
+      return ""
+
+  def _acquisitionDateTimeForFile(self, filePath):
+    """Return (datetime, source) for the real acquisition start of one PET image."""
+    acqDateTime = self._fileValue(filePath, "0008,002A")
+    parsed = _parse_dicom_datetime_value(acqDateTime)
+    if parsed is not None:
+      return parsed, "DICOM.0008,002A"
+
+    acqDate = self._fileValue(filePath, "0008,0022")
+    acqTime = self._fileValue(filePath, "0008,0032")
+    parsed = _parse_dicom_datetime(acqDate, acqTime)
+    if parsed is not None:
+      return parsed, "DICOM.0008,0022+0008,0032"
+
+    # Last-resort series clock. Keep the source explicit because this is less
+    # specific than Acquisition Date/Time and should be treated conservatively.
+    seriesDate = self._fileValue(filePath, "0008,0021") or self._fileValue(filePath, "0008,0020")
+    seriesTime = self._fileValue(filePath, "0008,0031")
+    parsed = _parse_dicom_datetime(seriesDate, seriesTime)
+    if parsed is not None:
+      return parsed, "DICOM.series-date-time-fallback"
+    return None, "Unavailable"
+
+  def _actualFrameDurationSecForFile(self, filePath):
+    """Return acquisition duration in seconds, or None if unavailable."""
+    value = self._fileValue(filePath, "0018,1242")  # Actual Frame Duration, ms
+    if value:
+      try:
+        duration = float(str(value).split('\\')[0]) / 1000.0
+        if duration > 0.0:
+          return duration, "DICOM.0018,1242"
+      except Exception:
+        pass
+
+    # Existing dPET convention used by some test/vendor data: seconds.
+    value = self._fileValue(filePath, "0067,1004")
+    if value:
+      try:
+        duration = float(str(value).split('\\')[0])
+        if duration > 0.0:
+          return duration, "DICOM.0067,1004"
+      except Exception:
+        pass
+    return None, "Unavailable"
+
+  def _seriesTypeValue1(self, filePath):
+    value = self._fileValue(filePath, "0054,1000").upper().strip()
+    if not value:
+      return ""
+    return value.split('\\')[0].strip()
+
+  def _resolveRadiopharmaceuticalStartDateTimeFromValues(
+      self, exactValue, startTimeValue, firstAcquisitionDt):
+    exactDt = _parse_dicom_datetime_value(exactValue or '')
+    if exactDt is not None:
+      return exactDt, 'DICOM.0018,1078'
+
+    startTime = str(startTimeValue or '').strip()
+    if not startTime or firstAcquisitionDt is None:
+      return None, 'Unavailable'
+
+    candidate = _parse_dicom_datetime(firstAcquisitionDt.strftime('%Y%m%d'), startTime)
+    if candidate is None:
+      return None, 'Unavailable'
+
+    candidates = [candidate - timedelta(days=1), candidate, candidate + timedelta(days=1)]
+    resolved = min(candidates, key=lambda dt: abs((firstAcquisitionDt - dt).total_seconds()))
+    return resolved, 'DICOM.0018,1072+acquisition-date'
+
+  def _commonPETMetadata(self, firstFile, firstAcquisitionDt):
+    """Collect compact quantitative/radiopharmaceutical metadata at import time."""
+    directTags = {
+      'PatientID': '0010,0020',
+      'PatientWeight': '0010,1030',
+      'Units': '0054,1001',
+      'SUVType': '0054,1006',
+      'DecayCorrection': '0054,1102',
+      'CorrectedImage': '0028,0051',
+      'DecayFactor': '0054,1321',
+      'FrameReferenceTime': '0054,1300',
+      'RadionuclideHalfLife': '0018,1075',
+      'RadionuclideTotalDose': '0018,1074',
+      'RadiopharmaceuticalStartDateTime': '0018,1078',
+      'RadiopharmaceuticalStartTime': '0018,1072',
+      'RadiopharmaceuticalName': '0018,0031',
+    }
+    out = {}
+    for name, tag in directTags.items():
+      value = self._fileValue(firstFile, tag)
+      if value:
+        out[name] = value
+
+    nested = self._getRadiopharmNested(firstFile)
+    for key, value in nested.items():
+      if value and not out.get(key):
+        out[key] = str(value)
+
+    startDt, startSource = self._resolveRadiopharmaceuticalStartDateTimeFromValues(
+      out.get('RadiopharmaceuticalStartDateTime', ''),
+      out.get('RadiopharmaceuticalStartTime', ''),
+      firstAcquisitionDt)
+    if startDt is not None:
+      out['RadionuclideStartDateTime'] = self._formatDicomDateTime(startDt)
+      out['InjectionDateTimeSource'] = startSource
+      if firstAcquisitionDt is not None:
+        out['InjectionToAcquisitionOffsetSec'] = float((firstAcquisitionDt - startDt).total_seconds())
+    else:
+      out['InjectionDateTimeSource'] = 'Unavailable'
+    return out
+
+  def _buildStaticKineticMetadata(self, files):
+    """Build self-contained timing/provenance metadata for STATIC/WHOLE BODY PET."""
+    if not files:
+      return None
+
+    firstFile = files[0]
+    seriesType = self._seriesTypeValue1(firstFile)
+    if seriesType not in ('STATIC', 'WHOLE BODY'):
+      return None
+
+    records = []
+    startDts = []
+    endDts = []
+    timingKeys = set()
+    startKeys = set()
+    durationKeys = set()
+    timingComplete = True
+    acquisitionSources = set()
+    durationSources = set()
+
+    for filePath in files:
+      startDt, startSource = self._acquisitionDateTimeForFile(filePath)
+      durationSec, durationSource = self._actualFrameDurationSecForFile(filePath)
+      acquisitionSources.add(startSource)
+      durationSources.add(durationSource)
+
+      if startDt is None or durationSec is None:
+        timingComplete = False
+      if startDt is not None:
+        startDts.append(startDt)
+        startKeys.add(self._formatDicomDateTime(startDt))
+      if durationSec is not None:
+        durationKeys.add(round(float(durationSec), 6))
+      endDt = None
+      if startDt is not None and durationSec is not None:
+        endDt = startDt + timedelta(seconds=float(durationSec))
+        endDts.append(endDt)
+        timingKeys.add((self._formatDicomDateTime(startDt), round(float(durationSec), 6)))
+
+      record = {
+        'sopInstanceUID': self._fileValue(filePath, '0008,0018'),
+        'sopClassUID': self._fileValue(filePath, '0008,0016'),
+        'instanceNumber': self._fileValue(filePath, '0020,0013'),
+        'acquisitionStartDateTime': self._formatDicomDateTime(startDt),
+        'acquisitionStartSource': startSource,
+        'durationSec': durationSec,
+        'durationSource': durationSource,
+        'acquisitionEndDateTime': self._formatDicomDateTime(endDt),
+      }
+      position = self._parseDICOMVector(self._fileValue(filePath, '0020,0032'), 3)
+      orientation = self._parseDICOMVector(self._fileValue(filePath, '0020,0037'), 6)
+      if position is not None:
+        record['imagePositionPatient'] = position
+      if orientation is not None:
+        record['imageOrientationPatient'] = orientation
+      records.append(record)
+
+    earliestStart = min(startDts) if startDts else None
+    latestEnd = max(endDts) if endDts else None
+    spatiallyVaryingTiming = (len(startKeys) > 1 or len(durationKeys) > 1 or len(timingKeys) > 1)
+    timingMode = 'INCOMPLETE'
+    if timingComplete:
+      timingMode = 'SPATIAL' if spatiallyVaryingTiming else 'UNIFORM'
+
+    common = self._commonPETMetadata(firstFile, earliestStart)
+    metadata = {
+      'schemaVersion': 1,
+      'metadataSource': 'dPETImporter',
+      'acquisitionKind': 'STATIC',
+      'seriesType': seriesType,
+      'wholeBody': bool(seriesType == 'WHOLE BODY' or spatiallyVaryingTiming),
+      'timingMode': timingMode,
+      'timingComplete': bool(timingComplete),
+      'spatiallyVaryingTiming': bool(spatiallyVaryingTiming),
+      'acquisitionStartDateTime': self._formatDicomDateTime(earliestStart),
+      'acquisitionEndDateTime': self._formatDicomDateTime(latestEnd),
+      'timingSources': sorted(acquisitionSources),
+      'durationSources': sorted(durationSources),
+      'studyInstanceUID': self._fileValue(firstFile, '0020,000D'),
+      'seriesInstanceUID': self._fileValue(firstFile, '0020,000E'),
+      'frameOfReferenceUID': self._fileValue(firstFile, '0020,0052'),
+      'common': common,
+      'spatialTiming': records,
+    }
+    return metadata
+
+  def _buildDynamicKineticMetadata(self, files, nFrames, filesPerFrame, mvNode):
+    """Build the same metadata contract for a dPETImporter dynamic sequence."""
+    if not files or nFrames < 1 or filesPerFrame < 1:
+      return None
+    firstFile = files[0]
+    frames = []
+    startDts = []
+    endDts = []
+    timingComplete = True
+    for frameIndex in range(nFrames):
+      filePath = files[frameIndex * filesPerFrame]
+      startDt, startSource = self._acquisitionDateTimeForFile(filePath)
+      durationSec, durationSource = self._actualFrameDurationSecForFile(filePath)
+      if startDt is None or durationSec is None:
+        timingComplete = False
+      if startDt is not None:
+        startDts.append(startDt)
+      endDt = None
+      if startDt is not None and durationSec is not None:
+        endDt = startDt + timedelta(seconds=float(durationSec))
+        endDts.append(endDt)
+      frames.append({
+        'index': frameIndex,
+        'acquisitionStartDateTime': self._formatDicomDateTime(startDt),
+        'acquisitionStartSource': startSource,
+        'durationSec': durationSec,
+        'durationSource': durationSource,
+        'acquisitionEndDateTime': self._formatDicomDateTime(endDt),
+      })
+
+    earliestStart = min(startDts) if startDts else None
+    latestEnd = max(endDts) if endDts else None
+    common = self._commonPETMetadata(firstFile, earliestStart)
+
+    # Prefer already normalized values from the existing dynamic parser.
+    for attr, key in (
+      ('RadionuclideStartDateTime', 'RadionuclideStartDateTime'),
+      ('dPET.InjectionDateTimeSource', 'InjectionDateTimeSource'),
+      ('dPET.InjectionToAcquisitionOffsetSec', 'InjectionToAcquisitionOffsetSec'),
+    ):
+      value = mvNode.GetAttribute(attr) if mvNode else None
+      if value not in (None, ''):
+        if key == 'InjectionToAcquisitionOffsetSec':
+          try:
+            value = float(value)
+          except Exception:
+            pass
+        common[key] = value
+
+    return {
+      'schemaVersion': 1,
+      'metadataSource': 'dPETImporter',
+      'acquisitionKind': 'DYNAMIC',
+      'seriesType': self._seriesTypeValue1(firstFile) or 'DYNAMIC',
+      'wholeBody': False,
+      'timingMode': 'FRAMES',
+      'timingComplete': bool(timingComplete),
+      'spatiallyVaryingTiming': False,
+      'acquisitionStartDateTime': self._formatDicomDateTime(earliestStart),
+      'acquisitionEndDateTime': self._formatDicomDateTime(latestEnd),
+      'studyInstanceUID': self._fileValue(firstFile, '0020,000D'),
+      'seriesInstanceUID': self._fileValue(firstFile, '0020,000E'),
+      'frameOfReferenceUID': self._fileValue(firstFile, '0020,0052'),
+      'common': common,
+      'frames': frames,
+    }
+
+  def _applyKineticMetadata(self, node, metadata):
+    if node is None or not metadata:
+      return
+    compact = json.dumps(metadata, separators=(',', ':'), ensure_ascii=False)
+    node.SetAttribute('dPET.KineticMetadataSchemaVersion', str(metadata.get('schemaVersion', 1)))
+    node.SetAttribute('dPET.KineticMetadata', compact)
+    node.SetAttribute('dPET.AcquisitionKind', str(metadata.get('acquisitionKind', '')))
+    node.SetAttribute('dPET.SeriesType', str(metadata.get('seriesType', '')))
+    node.SetAttribute('dPET.AcquisitionTimingMode', str(metadata.get('timingMode', '')))
+    node.SetAttribute('dPET.AcquisitionTimingComplete', '1' if metadata.get('timingComplete') else '0')
+    node.SetAttribute('dPET.SpatiallyVaryingTiming', '1' if metadata.get('spatiallyVaryingTiming') else '0')
+    node.SetAttribute('dPET.WholeBody', '1' if metadata.get('wholeBody') else '0')
+
+    startText = metadata.get('acquisitionStartDateTime') or ''
+    endText = metadata.get('acquisitionEndDateTime') or ''
+    if startText:
+      node.SetAttribute('dPET.AcquisitionStartDateTime', str(startText))
+      node.SetAttribute('dPET.FirstFrameAcquisitionDateTime', str(startText))
+    if endText:
+      node.SetAttribute('dPET.AcquisitionEndDateTime', str(endText))
+
+    for key, attr in (
+      ('studyInstanceUID', 'dPET.DICOM.StudyInstanceUID'),
+      ('seriesInstanceUID', 'dPET.DICOM.SeriesInstanceUID'),
+      ('frameOfReferenceUID', 'dPET.DICOM.FrameOfReferenceUID'),
+    ):
+      value = metadata.get(key)
+      if value:
+        node.SetAttribute(attr, str(value))
+
+    if metadata.get('acquisitionKind') == 'STATIC':
+      node.SetAttribute(
+        'dPET.Static.SpatialTiming',
+        json.dumps(metadata.get('spatialTiming', []), separators=(',', ':'), ensure_ascii=False))
+
+    common = metadata.get('common') or {}
+    commonAttributeMap = {
+      'PatientID': 'dPET.PatientID',
+      'PatientWeight': 'PatientWeight',
+      'Units': 'Units',
+      'SUVType': 'SUVType',
+      'DecayCorrection': 'DecayCorrection',
+      'CorrectedImage': 'CorrectedImage',
+      'DecayFactor': 'DecayFactor',
+      'FrameReferenceTime': 'FrameReferenceTime',
+      'RadionuclideHalfLife': 'RadionuclideHalfLife',
+      'RadionuclideTotalDose': 'RadionuclideTotalDose',
+      'RadiopharmaceuticalStartDateTime': 'RadiopharmaceuticalStartDateTime',
+      'RadiopharmaceuticalStartTime': 'RadiopharmaceuticalStartTime',
+      'RadiopharmaceuticalName': 'RadiopharmaceuticalName',
+      'RadionuclideCode': 'dPET.RadionuclideCode',
+      'RadiopharmaceuticalCode': 'dPET.RadiopharmaceuticalCode',
+      'RadionuclideStartDateTime': 'RadionuclideStartDateTime',
+      'InjectionDateTimeSource': 'dPET.InjectionDateTimeSource',
+      'InjectionToAcquisitionOffsetSec': 'dPET.InjectionToAcquisitionOffsetSec',
+    }
+    for key, attr in commonAttributeMap.items():
+      value = common.get(key)
+      if value not in (None, ''):
+        node.SetAttribute(attr, str(value))
+
+  def examineStaticFiles(self, files):
+    """Offer one optional metadata-preserving scalar loadable per static PET series."""
+    if not settingsValue('DICOM/dPETImporterStaticEnabled', True, converter=toBool):
+      return []
+    if not files:
+      return []
+
+    seriesLists = {}
+    for filePath in files:
+      if self._fileValue(filePath, self.tags['modality']).upper() != 'PT':
+        continue
+      sid = self._fileValue(filePath, self.tags['seriesInstanceUID']) or 'Unknown'
+      seriesLists.setdefault(sid, []).append(filePath)
+
+    scalarPluginClass = slicer.modules.dicomPlugins.get('DICOMScalarVolumePlugin')
+    if scalarPluginClass is None:
+      return []
+    scalarPlugin = scalarPluginClass()
+
+    loadables = []
+    for sid, seriesFiles in seriesLists.items():
+      seriesType = self._seriesTypeValue1(seriesFiles[0])
+      if seriesType not in ('STATIC', 'WHOLE BODY'):
+        continue
+
+      scalarLoadables = scalarPlugin.examine([seriesFiles]) or []
+      scalarLoadables = [item for item in scalarLoadables if getattr(item, 'files', None)]
+      if not scalarLoadables:
+        continue
+      # Prefer the interpretation that retains the complete series.
+      scalarLoadable = max(scalarLoadables, key=lambda item: len(item.files))
+      metadata = self._buildStaticKineticMetadata(scalarLoadable.files)
+      if not metadata:
+        continue
+
+      loadable = DICOMLoadable()
+      loadable.files = list(scalarLoadable.files)
+      baseName = scalarLoadable.name or self._fileValue(seriesFiles[0], self.tags['seriesDescription']) or 'Static PET'
+      loadable.name = f'{baseName} [dPET kinetic metadata]'
+      timingMode = metadata.get('timingMode', 'INCOMPLETE')
+      if timingMode == 'SPATIAL':
+        timingText = 'spatially varying acquisition timing preserved'
+      elif timingMode == 'UNIFORM':
+        timingText = 'uniform acquisition timing preserved'
+      else:
+        timingText = 'acquisition timing incomplete'
+      loadable.tooltip = (
+        'Optional SlicerDynamicPET static PET loader; keeps kinetic timing, radiopharmaceutical, '
+        f'quantitative, and DICOM identity metadata in MRML ({timingText}). '
+        'Left unchecked by default so dedicated PET/SUV importers remain preferred.')
+      loadable.selected = False
+      loadable.confidence = 0.40
+      loadable.dPETLoadMode = 'static'
+      loadable.dPETScalarLoadable = scalarLoadable
+      loadable.dPETKineticMetadata = metadata
+      loadables.append(loadable)
+    return loadables
+
+
   def examine(self,fileLists):
-    if not settingsValue("DICOM/dPETImporterEnabled", True, converter=toBool):
+    dynamicEnabled = settingsValue("DICOM/dPETImporterEnabled", True, converter=toBool)
+    staticEnabled = settingsValue("DICOM/dPETImporterStaticEnabled", True, converter=toBool)
+    if not dynamicEnabled and not staticEnabled:
       return []
 
     self.detailedLogging = settingsValue('DICOM/detailedLogging', False, converter=toBool)
-    loadables = []
+    dynamicLoadables = []
+    staticLoadables = []
     allfiles = []
+    lastFiles = []
     for files in fileLists:
-      loadables += self.examineFiles(files)
+      lastFiles = files
+      if dynamicEnabled:
+        dynamicLoadables += self.examineFiles(files)
+      if staticEnabled:
+        staticLoadables += self.examineStaticFiles(files)
       allfiles += files
 
-    if (not loadables) and len(allfiles)>len(files):
-      loadables += self.examineFilesMultiseries(allfiles)
+    if dynamicEnabled and (not dynamicLoadables) and lastFiles and len(allfiles) > len(lastFiles):
+      dynamicLoadables += self.examineFilesMultiseries(allfiles)
 
-    # --- annotate each loadable (MV and Sequence) with 2D/3D + SUV parsing status ---
+    # --- annotate each dynamic loadable (MV and Sequence) with 2D/3D + SUV parsing status ---
     def annotate(loadable, isSequence=False):
       mv = getattr(loadable, "multivolume", None)
       frameType = mv.GetAttribute('dPET.FrameType') if mv else None
@@ -301,45 +751,32 @@ class dPETImporterPluginClass(DICOMPlugin):
         ft = "unknown-dim"
 
       missing = self._missingSUVKeys(mv)
-      if len(missing) == 0:
-        suvTxt = "SUV:ok"
-      else:
-        # keep it short in tooltip; full list in debug log if you want
-        suvTxt = "SUV:missing"
-
+      suvTxt = "SUV:ok" if len(missing) == 0 else "SUV:missing"
       suffix = f" [{ft}; {suvTxt}]"
-
-      # name: short, tooltip: longer
-      if loadable.name:
-        loadable.name = loadable.name + suffix
-      else:
-        loadable.name = suffix.strip()
-
+      loadable.name = (loadable.name or '') + suffix
       if loadable.tooltip:
-        if len(missing) == 0:
-          loadable.tooltip = loadable.tooltip + suffix
-        else:
-          loadable.tooltip = loadable.tooltip + suffix + f" (missing: {', '.join(missing)})"
+        loadable.tooltip = loadable.tooltip + suffix
       else:
         loadable.tooltip = suffix.strip()
+      if missing:
+        loadable.tooltip += f" (missing: {', '.join(missing)})"
 
+    seqLoadables = []
     if hasattr(slicer.modules, 'sequences'):
-      seqLoadables = []
-      for loadable in loadables:
+      for loadable in dynamicLoadables:
         seqL = DICOMLoadable()
         seqL.files = loadable.files
         seqL.multivolume = loadable.multivolume
         seqL.selected = loadable.selected
         seqL.confidence = loadable.confidence
         seqL.loadAsVolumeSequence = True
-        # set name & tooltip (prefer the sequence label)
+        seqL.dPETLoadMode = 'dynamic'
         seqL.tooltip = (loadable.tooltip or '').replace('MultiVolume', 'Volume Sequence')
         seqL.name = (loadable.name or '').replace('MultiVolume', 'Volume Sequence')
         annotate(seqL, isSequence=True)
         seqLoadables.append(seqL)
-      # loadables[0:0] = seqLoadables
-      return seqLoadables
-    return []
+
+    return seqLoadables + staticLoadables
 
   def nameTooltipFromFile(self, dicomFilePath, nFrames, tagName, descriptionLevel=None):
     seriesNumber = slicer.dicomDatabase.fileValue(dicomFilePath, self.tags['seriesNumber'])
@@ -918,8 +1355,94 @@ class dPETImporterPluginClass(DICOMPlugin):
       return None
     return provenance
 
+
+  def _loadStaticPET(self, loadable):
+    """Load a STATIC/WHOLE BODY PET as scalar volume and persist kinetic metadata."""
+    scalarPluginClass = slicer.modules.dicomPlugins.get('DICOMScalarVolumePlugin')
+    if scalarPluginClass is None:
+      logging.error('[dPET static] DICOMScalarVolumePlugin is unavailable.')
+      return None
+    scalarPlugin = scalarPluginClass()
+
+    scalarLoadable = getattr(loadable, 'dPETScalarLoadable', None)
+    if scalarLoadable is None:
+      candidates = scalarPlugin.examine([loadable.files]) or []
+      candidates = [item for item in candidates if getattr(item, 'files', None)]
+      if not candidates:
+        logging.error('[dPET static] Scalar PET interpretation failed.')
+        return None
+      scalarLoadable = max(candidates, key=lambda item: len(item.files))
+    scalarLoadable.name = loadable.name.replace(' [dPET kinetic metadata]', '')
+
+    volumeNode = scalarPlugin.load(scalarLoadable)
+    if volumeNode is None:
+      logging.error('[dPET static] Scalar PET load failed.')
+      return None
+
+    metadata = getattr(loadable, 'dPETKineticMetadata', None)
+    if not metadata:
+      metadata = self._buildStaticKineticMetadata(scalarLoadable.files)
+    self._applyKineticMetadata(volumeNode, metadata)
+    volumeNode.SetAttribute('dPETImporter.LoadedBy', 'dPETImporterPlugin')
+    volumeNode.SetAttribute('dPETImporter.Version', '0.2')
+    volumeNode.SetAttribute('dPETImporter.Source', 'DICOM')
+    volumeNode.SetAttribute('dPETImporter.StaticKineticPET', '1')
+
+    ok, unitType = self._validateUnits(volumeNode)
+    doSUV = settingsValue('DICOM/dPETImporterSUVEnabled', True, converter=toBool)
+    factor = compute_suvbw_factor(volumeNode) if ok else None
+    factorValid = factor is not None and factor > 0.0
+    spatialTiming = bool(metadata and metadata.get('spatiallyVaryingTiming'))
+
+    valueType = (volumeNode.GetAttribute('Units') or 'Unknown').upper()
+    if ok and unitType == 'SUV':
+      valueType = 'SUVbw'
+    elif ok and unitType == 'BQML':
+      valueType = 'BQML'
+      # A single whole-volume factor is intentionally used only when every
+      # source image shares the same acquisition interval. For spatially
+      # varying whole-body timing, preserve Bq/mL and the metadata instead of
+      # applying a potentially incorrect global decay/SUV normalization.
+      if doSUV and factorValid and not spatialTiming:
+        if self._multiplyVolumeByConstant(volumeNode, factor):
+          valueType = 'SUVbw'
+      elif doSUV and spatialTiming:
+        logging.warning(
+          '[dPET static] Spatially varying whole-body timing detected; keeping Bq/mL '
+          'instead of applying one global SUVbw factor. Multi-timepoint analysis can '
+          'use the persisted timing/quantitative metadata to validate compatibility.')
+
+    volumeNode.SetAttribute('dPET.ValueType', valueType)
+    globalFactorValid = bool(factorValid and not spatialTiming)
+    if globalFactorValid:
+      volumeNode.SetAttribute('dPET.SUVbwFactor', str(float(factor)))
+      volumeNode.SetAttribute('dPET.SUVbwFactorValid', '1')
+    else:
+      # A factor computed from the earliest slice is not a validated whole-volume
+      # factor when spatial acquisition timing varies. Do not advertise it as such.
+      volumeNode.SetAttribute('dPET.SUVbwFactorValid', '0')
+
+    if valueType in ('SUVbw', 'BQML'):
+      self._setProxyQuantityUnits(volumeNode, valueType)
+    self.setPetDicomLUT(volumeNode)
+
+    appLogic = slicer.app.applicationLogic()
+    if appLogic:
+      selectionNode = appLogic.GetSelectionNode()
+      selectionNode.SetReferenceActiveVolumeID(volumeNode.GetID())
+      appLogic.PropagateVolumeSelection()
+
+    timingMode = metadata.get('timingMode', 'INCOMPLETE') if metadata else 'INCOMPLETE'
+    logging.info(
+      f"[dPET static] Loaded kinetic-ready PET '{volumeNode.GetName()}' "
+      f"(timing={timingMode}, valueType={valueType}).")
+    return volumeNode
+
   def load(self,loadable):
-    """Load as Volume Sequence (only sequence is supported in this minimal plugin)"""
+    """Load dynamic PET as sequence or optional static PET as scalar volume."""
+    if getattr(loadable, 'dPETLoadMode', None) == 'static':
+      return self._loadStaticPET(loadable)
+
     try:
       mvNode = loadable.multivolume
     except AttributeError:
@@ -946,6 +1469,10 @@ class dPETImporterPluginClass(DICOMPlugin):
     volumeSequenceNode.SetAttribute("dPETImporter.Source", "DICOM") # optional
     for attr in mvNode.GetAttributeNames():
       volumeSequenceNode.SetAttribute(attr, mvNode.GetAttribute(attr))
+
+    kineticMetadata = self._buildDynamicKineticMetadata(
+      files, nFrames, filesPerFrame, mvNode)
+    self._applyKineticMetadata(volumeSequenceNode, kineticMetadata)
 
     # Persist all DICOM identity needed for later Dynamic RTSTRUCT export.
     # This is deliberately captured while dPETImporter already has the indexed
@@ -1005,7 +1532,7 @@ class dPETImporterPluginClass(DICOMPlugin):
       # voxel values are converted on load. This allows DynamicPET to move
       # safely between SUVbw and activity concentration later without changing
       # the stored image values.
-      suvbwFactor = compute_suvbw_for_start(mvNode)
+      suvbwFactor = compute_suvbw_factor(mvNode)
       factorValid = suvbwFactor is not None and suvbwFactor > 0
 
       sequenceSUV = None
@@ -1013,7 +1540,7 @@ class dPETImporterPluginClass(DICOMPlugin):
         sequenceSUV = suvbwFactor
 
       if unitType == "BQML" and doSUV and sequenceSUV is None:
-        logging.warning("[dPET] SUV conversion disabled: series is not usable as decay-corrected-to-first-frame START.")
+        logging.warning("[dPET] SUV conversion disabled: series lacks a valid START/ADMIN SUVbw factor.")
 
       if unitType == "SUV" and not factorValid:
         logging.warning("[dPET] SUVbw values loaded, but no validated inverse SUVbw factor is available; Bq/mL conversion will be disabled in DynamicPET.")
@@ -1104,6 +1631,7 @@ class dPETImporterPluginClass(DICOMPlugin):
       if proxyVol:
         proxyVol.SetAttribute("dPETImporter.LoadedBy", "dPETImporterPlugin")
         proxyVol.SetAttribute('dPET.ValueType', sequenceValueType)
+        self._applyKineticMetadata(proxyVol, kineticMetadata)
 
         # Preserve injection/acquisition provenance on the proxy too.  The
         # sequence already receives all mvNode attributes above, but DynamicPET
@@ -1114,6 +1642,9 @@ class dPETImporterPluginClass(DICOMPlugin):
           'RadionuclideStartDateTime',
           'RadionuclideTotalDose',
           'RadionuclideHalfLife',
+          'PatientWeight',
+          'DecayCorrection',
+          'CorrectedImage',
           'dPET.FirstFrameAcquisitionDateTime',
           'dPET.InjectionDateTimeSource',
           'dPET.InjectionToAcquisitionOffsetSec'):
