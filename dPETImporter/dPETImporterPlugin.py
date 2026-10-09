@@ -1365,6 +1365,124 @@ class dPETImporterPluginClass(DICOMPlugin):
     except Exception:
       return None
 
+  def _canonicalizeLoadedFrameProvenance(self, frameNode, frameRecord, positionToleranceMm=1e-2):
+    """Put classic single-frame source instances in loaded Slicer K order.
+
+    DICOMScalarVolumePlugin sets DICOM.instanceUIDs so that UID i corresponds
+    to loaded voxel slice K=i, including any slice-order reversal performed to
+    obtain a right-handed IJK coordinate system.  Use that as the canonical
+    ordering, then independently verify the mapping against the Image Position
+    (Patient) values captured from the indexed source metadata.
+
+    Returns True when source identity is consistent.  For classic slice stacks
+    ``spatialOrderVerified`` is True only after the geometric position check.
+    A single-SOP 3D/multiframe source is retained as valid source identity but
+    is explicitly marked as not having a per-K SOP mapping.
+    """
+    if frameNode is None or frameRecord is None:
+      return False
+
+    uidText = frameNode.GetAttribute('DICOM.instanceUIDs') or ''
+    orderedUIDs = [uid for uid in uidText.split() if uid]
+    instances = list(frameRecord.get('instances') or [])
+    if not orderedUIDs or not instances:
+      return False
+
+    byUID = {}
+    for instance in instances:
+      uid = str(instance.get('sopInstanceUID') or '')
+      if not uid or uid in byUID:
+        return False
+      byUID[uid] = instance
+
+    if len(orderedUIDs) != len(instances) or set(orderedUIDs) != set(byUID):
+      logging.warning(
+        '[dPET] Loaded DICOM.instanceUIDs do not match the persisted source '
+        'instance set; exact spatial provenance was not accepted.')
+      frameRecord['spatialOrderVerified'] = False
+      return False
+
+    orderedInstances = [byUID[uid] for uid in orderedUIDs]
+    frameRecord['instances'] = orderedInstances
+    frameRecord['loadedInstanceUIDOrder'] = orderedUIDs
+
+    imageData = frameNode.GetImageData()
+    if imageData is None:
+      frameRecord['spatialOrderVerified'] = False
+      return False
+
+    numberOfSlices = int(imageData.GetDimensions()[2])
+
+    # One SOP owning the complete 3D/multiframe volume is a valid source
+    # identity, but there is no one-SOP-per-K mapping to verify here.
+    if len(orderedUIDs) == 1 and numberOfSlices > 1:
+      frameRecord['spatialMapping'] = 'SINGLE_SOP_VOLUME'
+      frameRecord['spatialOrderVerified'] = False
+      return True
+
+    if len(orderedUIDs) != numberOfSlices:
+      logging.warning(
+        '[dPET] Source instance count does not match loaded PET K dimension; '
+        'exact per-slice DICOM provenance was not accepted.')
+      frameRecord['spatialOrderVerified'] = False
+      return False
+
+    ijkToRAS = vtk.vtkMatrix4x4()
+    frameNode.GetIJKToRASMatrix(ijkToRAS)
+
+    # Verify UID[k] against the physical position of loaded Slicer slice K=k.
+    for k, instance in enumerate(orderedInstances):
+      position = instance.get('imagePositionPatient')
+      if not isinstance(position, (list, tuple)) or len(position) != 3:
+        frameRecord['spatialOrderVerified'] = False
+        return False
+
+      ras = [0.0, 0.0, 0.0, 1.0]
+      ijkToRAS.MultiplyPoint([0.0, 0.0, float(k), 1.0], ras)
+      loadedLPS = [-float(ras[0]), -float(ras[1]), float(ras[2])]
+
+      if max(abs(float(position[i]) - loadedLPS[i]) for i in range(3)) > float(positionToleranceMm):
+        logging.warning(
+          f'[dPET] Source UID {orderedUIDs[k]} position does not match loaded '
+          f'Slicer slice K={k}; exact spatial provenance was not accepted.')
+        frameRecord['spatialOrderVerified'] = False
+        return False
+
+    # Verify that the source in-plane orientation agrees with the loaded
+    # Slicer I/J axes after RAS -> DICOM LPS conversion.
+    def normalizedLPSAxis(column):
+      vector = [
+        -float(ijkToRAS.GetElement(0, column)),
+        -float(ijkToRAS.GetElement(1, column)),
+         float(ijkToRAS.GetElement(2, column)),
+      ]
+      norm = sum(component * component for component in vector) ** 0.5
+      return [component / norm for component in vector] if norm > 0.0 else None
+
+    iAxisLPS = normalizedLPSAxis(0)
+    jAxisLPS = normalizedLPSAxis(1)
+    if iAxisLPS is None or jAxisLPS is None:
+      frameRecord['spatialOrderVerified'] = False
+      return False
+
+    expectedOrientation = iAxisLPS + jAxisLPS
+    for instance in orderedInstances:
+      orientation = instance.get('imageOrientationPatient')
+      if not isinstance(orientation, (list, tuple)) or len(orientation) != 6:
+        frameRecord['spatialOrderVerified'] = False
+        return False
+      if max(abs(float(orientation[i]) - expectedOrientation[i]) for i in range(6)) > 1e-5:
+        logging.warning(
+          '[dPET] Source ImageOrientationPatient does not match the loaded PET '
+          'I/J axes; exact spatial provenance was not accepted.')
+        frameRecord['spatialOrderVerified'] = False
+        return False
+
+    frameRecord['spatialMapping'] = 'CLASSIC_SOP_PER_K'
+    frameRecord['spatialOrderVerified'] = True
+    return True
+
+
   def _buildDynamicRTExportProvenance(self, files, nFrames, filesPerFrame):
     """Build compact frame-wise DICOM provenance from the indexed DICOM DB.
 
@@ -1407,7 +1525,7 @@ class dPETImporterPluginClass(DICOMPlugin):
     }
 
     provenance = {
-      'schemaVersion': 1,
+      'schemaVersion': 2,
       'studyInstanceUID': value(firstFile, '0020,000D'),
       'seriesInstanceUID': value(firstFile, '0020,000E'),
       'frameOfReferenceUID': value(firstFile, '0020,0052'),
@@ -1441,6 +1559,7 @@ class dPETImporterPluginClass(DICOMPlugin):
         instanceNumber = value(filePath, '0020,0013')
         if instanceNumber:
           instance['instanceNumber'] = instanceNumber
+
         instances.append(instance)
 
       provenance['frames'].append({
@@ -1577,15 +1696,13 @@ class dPETImporterPluginClass(DICOMPlugin):
       files, nFrames, filesPerFrame, mvNode)
     self._applyKineticMetadata(volumeSequenceNode, kineticMetadata)
 
-    # Persist all DICOM identity needed for later Dynamic RTSTRUCT export.
-    # This is deliberately captured while dPETImporter already has the indexed
-    # source series available, so normal export never needs to reopen DICOM.
+    # Capture source identity/geometry metadata while the indexed DICOM series
+    # is still available.  Per-frame instance ordering is finalized only after
+    # DICOMScalarVolumePlugin has loaded each frame, because that plugin is the
+    # authority for the final Slicer K ordering.
     dynamicRTProvenance = self._buildDynamicRTExportProvenance(
       files, nFrames, filesPerFrame)
     if dynamicRTProvenance is not None:
-      provenanceJson = json.dumps(
-        dynamicRTProvenance, separators=(',', ':'), ensure_ascii=False)
-      volumeSequenceNode.SetAttribute('dPET.DICOM.FrameReferences', provenanceJson)
       volumeSequenceNode.SetAttribute(
         'dPET.DICOM.StudyInstanceUID', dynamicRTProvenance['studyInstanceUID'])
       volumeSequenceNode.SetAttribute(
@@ -1594,11 +1711,9 @@ class dPETImporterPluginClass(DICOMPlugin):
       if frameOfReferenceUID:
         volumeSequenceNode.SetAttribute(
           'dPET.DICOM.FrameOfReferenceUID', frameOfReferenceUID)
-      volumeSequenceNode.SetAttribute('dPET.DICOM.ProvenanceSchemaVersion', '1')
     else:
       logging.warning(
-        '[dPET] Could not persist complete Dynamic RTSTRUCT DICOM provenance; '
-        'export can still fall back to MRML/DICOM database/source metadata.')
+        '[dPET] Could not capture complete DICOM source provenance at import time.')
 
     try:
       frame_times = json.loads(mvNode.GetAttribute('dPET.FrameTimes') or '[]')
@@ -1668,6 +1783,15 @@ class dPETImporterPluginClass(DICOMPlugin):
         seqDataNode = volumeSequenceNode.GetDataNodeAtValue(idx) or frameNode
         seqDataNode.SetAttribute("dPETImporter.LoadedBy", "dPETImporterPlugin")
 
+        # DICOMScalarVolumePlugin has now established the final voxel K order
+        # and its DICOM.instanceUIDs attribute follows that order exactly.
+        # Canonicalize and independently verify the persisted source references
+        # against the loaded slice positions before accepting per-slice mapping.
+        if (dynamicRTProvenance is not None
+            and fi < len(dynamicRTProvenance.get('frames', []))):
+          self._canonicalizeLoadedFrameProvenance(
+            frameNode, dynamicRTProvenance['frames'][fi])
+
         # set per-frame attributes on the stored volume node
         if fi < len(frame_durations) and frame_durations[fi] not in (None, ""):
           seqDataNode.SetAttribute('dPET.Duration', str(frame_durations[fi]))
@@ -1711,6 +1835,16 @@ class dPETImporterPluginClass(DICOMPlugin):
           slicer.mrmlScene.RemoveNode(frameNode.GetStorageNode())
         if frameNode is not seqDataNode:
           slicer.mrmlScene.RemoveNode(frameNode)
+
+      # Persist finalized source references only after every loaded frame has
+      # been reconciled with Slicer's canonical DICOM.instanceUIDs ordering.
+      if dynamicRTProvenance is not None:
+        provenanceJson = json.dumps(
+          dynamicRTProvenance, separators=(',', ':'), ensure_ascii=False)
+        volumeSequenceNode.SetAttribute('dPET.DICOM.FrameReferences', provenanceJson)
+        volumeSequenceNode.SetAttribute(
+          'dPET.DICOM.ProvenanceSchemaVersion',
+          str(dynamicRTProvenance.get('schemaVersion', 2)))
 
       # create browser and show sequence
       volumeSequenceNode.SetAttribute('dPET.ValueType', sequenceValueType)
@@ -1830,11 +1964,11 @@ class dPETParametricMapPluginClass(DICOMPlugin):
 
     except ImportError:
       logging.info(
-        "[dPET PM] Installing highdicom 0.28.1..."
+        "[dPET PM] Installing highdicom..."
       )
 
       slicer.util.pip_install(
-        "highdicom==0.28.1"
+        "highdicom"
       )
 
       import importlib
@@ -2140,6 +2274,248 @@ class dPETParametricMapPluginClass(DICOMPlugin):
         )
 
 
+  @staticmethod
+  def _firstNumericValue(value):
+    if value is None:
+      return None
+    try:
+      if isinstance(value, (list, tuple)):
+        if len(value) == 0:
+          return None
+        return float(value[0])
+      # pydicom MultiValue behaves as an iterable but should not be confused
+      # with a numeric string.
+      if not isinstance(value, (str, bytes)) and hasattr(value, "__len__"):
+        if len(value) == 0:
+          return None
+        return float(value[0])
+      text = str(value).strip()
+      if "\\" in text:
+        text = text.split("\\", 1)[0]
+      return float(text)
+    except Exception:
+      return None
+
+
+  def _parametricMapStoredWindow(self, pm):
+    """Return (minimum, maximum) from DICOM VOI window, if present."""
+    import numpy as np
+
+    def fromDataset(dataset):
+      if dataset is None:
+        return None
+      center = self._firstNumericValue(
+        getattr(dataset, "WindowCenter", None)
+      )
+      width = self._firstNumericValue(
+        getattr(dataset, "WindowWidth", None)
+      )
+      if center is None or width is None or width <= 0.0:
+        return None
+      minimum = center - 0.5 * width
+      maximum = center + 0.5 * width
+      if not (np.isfinite(minimum) and np.isfinite(maximum)):
+        return None
+      if maximum <= minimum:
+        return None
+      return float(minimum), float(maximum)
+
+    result = fromDataset(pm)
+    if result is not None:
+      return result
+
+    shared = getattr(pm, "SharedFunctionalGroupsSequence", None)
+    if shared:
+      voi = getattr(shared[0], "FrameVOILUTSequence", None)
+      if voi:
+        result = fromDataset(voi[0])
+        if result is not None:
+          return result
+
+    perFrame = getattr(pm, "PerFrameFunctionalGroupsSequence", None)
+    if perFrame:
+      voi = getattr(perFrame[0], "FrameVOILUTSequence", None)
+      if voi:
+        result = fromDataset(voi[0])
+        if result is not None:
+          return result
+
+    return None
+
+
+  @staticmethod
+  def _fallbackParametricDisplayRange(pixelArray, quantityCode):
+    """Robust fallback only for PMs that do not carry usable DICOM W/L."""
+    import numpy as np
+    values = np.asarray(pixelArray, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+      return None
+
+    if quantityCode == "SDP_VB":
+      return 0.0, 1.0, "Physical[0,1]"
+
+    q25, q75 = np.percentile(values, [25.0, 75.0])
+    centralWidth = max(0.0, float(q75 - q25))
+
+    if (
+      quantityCode == "SDP_TD"
+      or (
+        quantityCode == "SDP_INT"
+        and float(np.min(values)) < 0.0
+        and float(np.max(values)) > 0.0
+      )
+    ):
+      absValues = np.abs(values)
+      selected = None
+      for percentile, label in (
+          (99.0, "SymmetricP99Abs"),
+          (98.0, "SymmetricP98Abs"),
+          (95.0, "SymmetricP95Abs")):
+        halfRange = float(np.percentile(absValues, percentile))
+        if not np.isfinite(halfRange) or halfRange <= 0.0:
+          continue
+        selected = (-halfRange, halfRange, label)
+        occupancy = centralWidth / max(2.0 * halfRange, 1.0e-12)
+        if occupancy >= 0.20:
+          break
+      return selected
+
+    for lowPercentile, highPercentile, label in (
+        (1.0, 99.0, "P1-P99"),
+        (2.0, 98.0, "P2-P98"),
+        (5.0, 95.0, "P5-P95")):
+      minimum, maximum = np.percentile(
+        values,
+        [lowPercentile, highPercentile]
+      )
+      minimum = float(minimum)
+      maximum = float(maximum)
+      if not (
+        np.isfinite(minimum)
+        and np.isfinite(maximum)
+        and maximum > minimum
+      ):
+        continue
+      occupancy = centralWidth / max(maximum - minimum, 1.0e-12)
+      selected = (minimum, maximum, label)
+      if occupancy >= 0.20 or label == "P5-P95":
+        return selected
+
+    minimum = float(np.min(values))
+    maximum = float(np.max(values))
+    if maximum <= minimum:
+      scale = max(1.0, abs(minimum), abs(maximum))
+      epsilon = 1.0e-6 * scale
+      minimum -= 0.5 * epsilon
+      maximum += 0.5 * epsilon
+    return minimum, maximum, "FiniteMinMaxFallback"
+
+
+  def _applyParametricMapDisplayPreset(
+      self,
+      volumeNode,
+      pm,
+      pixelArray):
+    """Restore SlicerDynamicPET display intent without changing voxel values."""
+    import numpy as np
+    if volumeNode is None:
+      return
+
+    volumeNode.CreateDefaultDisplayNodes()
+    displayNode = volumeNode.GetDisplayNode()
+    if displayNode is None:
+      return
+
+    quantityCode = str(
+      volumeNode.GetAttribute("SlicerDynamicPET.QuantityCode")
+      or ""
+    )
+
+    finiteValues = np.asarray(pixelArray, dtype=np.float64)
+    finiteValues = finiteValues[np.isfinite(finiteValues)]
+    interceptSpansZero = (
+      quantityCode == "SDP_INT"
+      and finiteValues.size > 0
+      and float(np.min(finiteValues)) < 0.0
+      and float(np.max(finiteValues)) > 0.0
+    )
+
+    if quantityCode in (
+        "SDP_AIC",
+        "SDP_BIC",
+        "SDP_MASE",
+        "SDP_CHI2"):
+      colorNodeID = "vtkMRMLColorTableNodeFileMagma.txt"
+    elif quantityCode == "SDP_TD" or interceptSpansZero:
+      colorNodeID = "vtkMRMLColorTableNodeFileDivergingBlueRed.txt"
+    else:
+      colorNodeID = "vtkMRMLColorTableNodeFileViridis.txt"
+
+    # vb is intentionally always displayed over its physical [0,1] domain.
+    if quantityCode == "SDP_VB":
+      displayRange = (0.0, 1.0)
+      policy = "Physical[0,1]"
+    else:
+      displayRange = self._parametricMapStoredWindow(pm)
+      policy = "DICOMWindowLevel"
+
+      if displayRange is None:
+        fallback = self._fallbackParametricDisplayRange(
+          pixelArray,
+          quantityCode
+        )
+        if fallback is None:
+          return
+        displayRange = fallback[:2]
+        policy = fallback[2]
+
+    minimum, maximum = displayRange
+    if not (
+      np.isfinite(minimum)
+      and np.isfinite(maximum)
+      and maximum > minimum
+    ):
+      return
+
+    displayNode.SetAutoWindowLevel(False)
+    displayNode.SetWindowLevelMinMax(
+      float(minimum),
+      float(maximum)
+    )
+    displayNode.SetInterpolate(True)
+    displayNode.SetInvertDisplayScalarRange(False)
+    displayNode.SetWindowMappingMethod(
+      slicer.vtkMRMLScalarVolumeDisplayNode.GetWindowMappingMethodFromString(
+        "Linear"
+      )
+    )
+    displayNode.SetApplyThreshold(False)
+    displayNode.SetAutoThreshold(False)
+    displayNode.SetAndObserveColorNodeID(colorNodeID)
+
+    volumeNode.SetAttribute(
+      "SlicerDynamicPET.Display.RangePolicy",
+      str(policy)
+    )
+    volumeNode.SetAttribute(
+      "SlicerDynamicPET.Display.WindowMin",
+      format(float(minimum), ".16g")
+    )
+    volumeNode.SetAttribute(
+      "SlicerDynamicPET.Display.WindowMax",
+      format(float(maximum), ".16g")
+    )
+    volumeNode.SetAttribute(
+      "SlicerDynamicPET.Display.ColorNodeID",
+      colorNodeID
+    )
+    volumeNode.SetAttribute(
+      "SlicerDynamicPET.Display.Mapping",
+      "Linear"
+    )
+
+
   def load(self, loadable):
     """
     Load a DICOM Parametric Map as a vtkMRMLScalarVolumeNode.
@@ -2163,11 +2539,19 @@ class dPETParametricMapPluginClass(DICOMPlugin):
       filePath = loadable.files[0]
 
       # --------------------------------------------------------------
-      # Read PM using highdicom
+      # Read PM using highdicom's dedicated Parametric Map reader.
       # --------------------------------------------------------------
 
-      pm = hd.imread(
-          filePath
+      pmread = getattr(
+        getattr(hd, "pm", None),
+        "pmread",
+        None
+      )
+
+      pm = (
+        pmread(filePath)
+        if callable(pmread)
+        else hd.imread(filePath)
       )
 
       if (
@@ -2180,38 +2564,202 @@ class dPETParametricMapPluginClass(DICOMPlugin):
         )
 
       # --------------------------------------------------------------
-      # Recover real-world voxel values and spatial geometry
+      # Recover real-world voxel values and spatial geometry.
       #
-      # highdicom Volume uses:
-      #   array axes = [K, J, I]
-      #   affine     = KJI -> DICOM LPS
+      # Float Pixel Data intentionally has no PixelRepresentation in
+      # DICOM. Some highdicom releases nevertheless access that attribute
+      # in Image.get_volume(), so use pydicom's float-aware pixel decoder
+      # and highdicom's geometry-only API for floating-point PMs.
+      # Integer PMs continue through highdicom.get_volume().
       # --------------------------------------------------------------
 
-      parametricVolume = pm.get_volume(
-        dtype=np.float32,
-        apply_real_world_transform=True
+      hasFloatPixelData = (
+        hasattr(pm, "FloatPixelData")
+        or hasattr(pm, "DoubleFloatPixelData")
       )
 
-      pixelArray = np.asarray(
-        parametricVolume.array,
-        dtype=np.float32
-      )
+      if hasFloatPixelData and not hasattr(pm, "PixelRepresentation"):
+        storedArray = np.asarray(pm.pixel_array)
 
-      if pixelArray.ndim != 3:
-        raise RuntimeError(
-          "Expected a 3D scalar Parametric Map, "
-          f"but got shape {pixelArray.shape}."
+        if storedArray.ndim == 2:
+          storedArray = storedArray[np.newaxis, :, :]
+
+        if storedArray.ndim != 3:
+          raise RuntimeError(
+            "Expected a 3D scalar Parametric Map, "
+            f"but got stored pixel shape {storedArray.shape}."
+          )
+
+        # Apply the PM's real-world value mapping. SlicerDynamicPET writes
+        # a linear mapping, but support a standard LUT mapping as well.
+        mapping = self._firstRealWorldValueMapping(pm)
+        if mapping is None:
+          raise RuntimeError(
+            "Parametric Map does not contain a "
+            "Real World Value Mapping."
+          )
+
+        slope = getattr(mapping, "RealWorldValueSlope", None)
+        intercept = getattr(mapping, "RealWorldValueIntercept", None)
+
+        if slope is not None and intercept is not None:
+          pixelArrayStoredOrder = (
+            storedArray.astype(np.float32, copy=False)
+            * float(slope)
+            + float(intercept)
+          )
+        else:
+          lutData = getattr(mapping, "RealWorldValueLUTData", None)
+          firstMapped = getattr(
+            mapping,
+            "RealWorldValueFirstValueMapped",
+            None
+          )
+          if firstMapped is None:
+            firstMapped = getattr(
+              mapping,
+              "DoubleFloatRealWorldValueFirstValueMapped",
+              None
+            )
+
+          if lutData is None or firstMapped is None:
+            raise RuntimeError(
+              "Unsupported Real World Value Mapping in "
+              "floating-point Parametric Map."
+            )
+
+          if not np.issubdtype(storedArray.dtype, np.integer):
+            raise RuntimeError(
+              "A LUT-based Real World Value Mapping requires "
+              "integer stored pixel values."
+            )
+
+          lut = np.asarray(lutData, dtype=np.float32)
+          lutIndices = storedArray.astype(np.int64) - int(firstMapped)
+          if (
+            np.any(lutIndices < 0)
+            or np.any(lutIndices >= lut.size)
+          ):
+            raise RuntimeError(
+              "Stored Parametric Map pixels fall outside the "
+              "Real World Value LUT range."
+            )
+          pixelArrayStoredOrder = lut[lutIndices]
+
+        # Geometry can be obtained without decoding/transformation of pixels.
+        geometry = pm.get_volume_geometry()
+        if geometry is None:
+          raise RuntimeError(
+            "Parametric Map frames do not form a regular 3D volume."
+          )
+
+        kjiToLPS = np.asarray(
+          geometry.affine,
+          dtype=np.float64
         )
 
-      kjiToLPS = np.asarray(
-        parametricVolume.affine,
-        dtype=np.float64
-      )
+        if kjiToLPS.shape != (4, 4):
+          raise RuntimeError(
+            "Invalid Parametric Map affine matrix."
+          )
 
-      if kjiToLPS.shape != (4, 4):
-        raise RuntimeError(
-          "Invalid Parametric Map affine matrix."
+        # pm.pixel_array is in stored DICOM frame order, while the volume
+        # geometry is in spatial K order. Match each spatial plane back to
+        # its stored frame by Image Position (Patient) rather than assuming
+        # those orders are identical.
+        perFrame = getattr(
+          pm,
+          "PerFrameFunctionalGroupsSequence",
+          None
         )
+        if perFrame is None or len(perFrame) != storedArray.shape[0]:
+          raise RuntimeError(
+            "Parametric Map frame geometry is incomplete."
+          )
+
+        storedPositions = []
+        for frameGroup in perFrame:
+          positionSequence = getattr(
+            frameGroup,
+            "PlanePositionSequence",
+            None
+          )
+          if not positionSequence:
+            raise RuntimeError(
+              "Parametric Map frame is missing Plane Position."
+            )
+          storedPositions.append(
+            np.asarray(
+              positionSequence[0].ImagePositionPatient,
+              dtype=np.float64
+            )
+          )
+
+        spatialPositions = []
+        for positionSequence in geometry.get_plane_positions():
+          spatialPositions.append(
+            np.asarray(
+              positionSequence[0].ImagePositionPatient,
+              dtype=np.float64
+            )
+          )
+
+        if len(spatialPositions) != len(storedPositions):
+          raise RuntimeError(
+            "Parametric Map spatial frame count does not match "
+            "the stored pixel frame count."
+          )
+
+        frameOrder = []
+        usedStoredFrames = set()
+        for spatialPosition in spatialPositions:
+          distances = [
+            float(np.linalg.norm(position - spatialPosition))
+            for position in storedPositions
+          ]
+          storedIndex = int(np.argmin(distances))
+          if (
+            distances[storedIndex] > 1.0e-3
+            or storedIndex in usedStoredFrames
+          ):
+            raise RuntimeError(
+              "Could not match Parametric Map stored frames to "
+              "their spatial volume positions."
+            )
+          usedStoredFrames.add(storedIndex)
+          frameOrder.append(storedIndex)
+
+        pixelArray = np.asarray(
+          pixelArrayStoredOrder[frameOrder, :, :],
+          dtype=np.float32
+        )
+
+      else:
+        parametricVolume = pm.get_volume(
+          dtype=np.float32,
+          apply_real_world_transform=True
+        )
+
+        pixelArray = np.asarray(
+          parametricVolume.array,
+          dtype=np.float32
+        )
+
+        if pixelArray.ndim != 3:
+          raise RuntimeError(
+            "Expected a 3D scalar Parametric Map, "
+            f"but got shape {pixelArray.shape}."
+          )
+
+        kjiToLPS = np.asarray(
+          parametricVolume.affine,
+          dtype=np.float64
+        )
+
+        if kjiToLPS.shape != (4, 4):
+          raise RuntimeError(
+            "Invalid Parametric Map affine matrix."
+          )
 
       # --------------------------------------------------------------
       # Convert highdicom KJI indexing to Slicer IJK indexing.
@@ -2392,22 +2940,17 @@ class dPETParametricMapPluginClass(DICOMPlugin):
 
       # --------------------------------------------------------------
       # Display
+      #
+      # Prefer the robust window/level persisted in the DICOM PM.  The
+      # quantity code selects a Slicer LUT, while mapping remains linear and
+      # thresholding remains disabled.
       # --------------------------------------------------------------
 
-      volumeNode.CreateDefaultDisplayNodes()
-
-      displayNode = (
-        volumeNode.GetDisplayNode()
+      self._applyParametricMapDisplayPreset(
+        volumeNode,
+        pm,
+        pixelArray
       )
-
-      if displayNode:
-        displayNode.SetAutoWindowLevel(
-          True
-        )
-
-        displayNode.SetInterpolate(
-          True
-        )
 
       # --------------------------------------------------------------
       # Put it into the DICOM patient/study hierarchy.
