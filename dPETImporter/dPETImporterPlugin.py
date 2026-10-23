@@ -1964,11 +1964,13 @@ class dPETParametricMapPluginClass(DICOMPlugin):
 
     except ImportError:
       logging.info(
-        "[dPET PM] Installing highdicom..."
+        "[dPET PM] Installing highdicom without dependencies..."
       )
 
+      # Slicer has a shared Python environment. Do not let pip upgrade or
+      # replace Slicer's pydicom/numpy/etc. while enabling PM import.
       slicer.util.pip_install(
-        "highdicom"
+        "--no-deps highdicom"
       )
 
       import importlib
