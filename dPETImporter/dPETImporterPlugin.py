@@ -106,6 +106,199 @@ def compute_suvbw_for_start(mvNode):
 
 
 
+# PET volumes can have a very sparse intensity histogram (notably early frames
+# of dynamic PET).  Slicer's 0.1/99.9-percentile automatic window can then
+# collapse even though the image contains valid nonzero voxel values.  Keep the
+# ordinary automatic behavior unless that exceptional condition is detected.
+def _dpetApplyCollapsedAutoWindowFallback(volumeNode):
+  """Fix only PET auto W/L failures caused by empty or extremely sparse frames.
+
+  Voxel data are never modified. A sparse frame means the top 0.1 percent
+  excluded by Slicer's histogram W/L contain essentially all meaningful
+  activity. The frame-specific display setting is managed by the sequence
+  browser observer (which restores auto W/L on the next normal frame).
+  """
+  import math
+  import numpy as np
+  if volumeNode is None:
+    return None
+  display = volumeNode.GetDisplayNode()
+  image = volumeNode.GetImageData()
+  if display is None or image is None or not display.GetAutoWindowLevel():
+    return None
+
+  valueType = (volumeNode.GetAttribute('dPET.ValueType') or '').upper()
+  if valueType == 'SUVBW':
+    displayFloor = 1.0
+  elif valueType == 'BQML':
+    displayFloor = 1000.0
+  else:
+    return None
+
+  # CalculateAutoLevels() is a C++ MRML method that is not wrapped in Slicer's
+  # Python API. Modified() invokes Slicer's native auto-W/L recalculation
+  # for the current volume while AutoWindowLevel is enabled.
+  display.Modified()
+  window = float(display.GetWindow())
+  level = float(display.GetLevel())
+  low, high = (float(x) for x in image.GetScalarRange())
+  if not all(math.isfinite(v) for v in (low, high, window, level)):
+    return None
+
+  reason = None
+  activeFraction = None
+  autoUpper = level + window / 2.0
+  if high <= displayFloor * 1.0e-6:
+    # An almost-empty volume must NOT map quantization noise to white.
+    reason = 'near-zero image'
+  elif window <= displayFloor * 1.0e-8:
+    reason = 'numerically collapsed window'
+  elif (window < displayFloor and autoUpper < displayFloor):
+    # An apparently nonzero auto window can still show only numerical noise
+    # when <0.1% of voxels carry measurable PET activity. This is common in
+    # early dynamic PET where Slicer's 99.9th percentile misses the signal.
+    scalars = image.GetPointData().GetScalars() if image.GetPointData() else None
+    if scalars is not None and scalars.GetNumberOfComponents() == 1:
+      samples = vtk.util.numpy_support.vtk_to_numpy(scalars)
+      stride = max(1, samples.size // 250000)
+      samples = samples[::stride]
+      samples = samples[np.isfinite(samples)]
+      if samples.size:
+        signalThreshold = min(0.01 * displayFloor, 1.0e-4 * high)
+        activeFraction = float(np.count_nonzero(samples > signalThreshold) / samples.size)
+        if activeFraction < 0.001:
+          reason = 'meaningful activity excluded from auto histogram'
+
+  if reason is None:
+    return None
+
+  upper = max(displayFloor, high)
+  if not math.isfinite(upper) or upper <= 0.0:
+    return None
+  display.AutoWindowLevelOff()
+  display.SetWindowLevelMinMax(0.0, upper)
+  logging.info('[dPET display] PET W/L fallback: %s, autoW=%.10g, '
+               'autoL=%.10g, image=[%.10g, %.10g], signalFraction=%s; '
+               'fallback=[0, %.10g] %s', reason, window, level, low, high,
+               activeFraction, upper, valueType)
+  return (float(display.GetWindow()), float(display.GetLevel()))
+
+
+_dpetPETWindowGuards = {}
+
+
+class _dpetPETSequenceWindowGuard:
+  """Recheck automatic PET windowing after each Sequence Browser item change.
+
+  The display node belongs to the proxy, not to each stored frame.  Therefore
+  a fallback must be undone before evaluating the next item.  A user-entered
+  manual window/level always takes precedence.
+  """
+  def __init__(self, browser, sequence, proxy):
+    self.browser = browser
+    self.sequence = sequence
+    self.proxy = proxy
+    self.browserID = browser.GetID()
+    self.lastItem = None
+    self.fallbackWL = None
+    self.queued = False
+    self.active = True
+    self.browserObserver = browser.AddObserver(
+      vtk.vtkCommand.ModifiedEvent, self._onBrowserModified)
+    self.browserDeleteObserver = browser.AddObserver(
+      vtk.vtkCommand.DeleteEvent, self._onBrowserDeleted)
+    self.sceneObserver = slicer.mrmlScene.AddObserver(
+      slicer.vtkMRMLScene.StartCloseEvent, self._onSceneClosing)
+    self._schedule()
+
+  def _onBrowserModified(self, caller=None, event=None):
+    if self.active and self.browser.GetSelectedItemNumber() != self.lastItem:
+      self._schedule()
+
+  def _onSceneClosing(self, caller=None, event=None):
+    self.close()
+
+  def _onBrowserDeleted(self, caller=None, event=None):
+    # Do not touch observer tags on an object being destroyed.
+    self.close(browserDeleted=True)
+
+  def _schedule(self):
+    if self.queued or not self.active:
+      return
+    self.queued = True
+    # Slicer's sequence logic must finish copying the new frame into the proxy
+    # before its automatic W/L is inspected.
+    qt.QTimer.singleShot(0, self._evaluate)
+
+  @staticmethod
+  def _sameWindowLevel(display, expected):
+    return (abs(float(display.GetWindow()) - expected[0]) <=
+            1.0e-9 * max(1.0, abs(expected[0]))
+            and abs(float(display.GetLevel()) - expected[1]) <=
+            1.0e-9 * max(1.0, abs(expected[1])))
+
+  def _evaluate(self):
+    self.queued = False
+    if not self.active:
+      return
+    try:
+      if (self.browser.GetScene() is None or self.proxy.GetScene() is None
+          or self.browser.GetMasterSequenceNode() != self.sequence):
+        self.close()
+        return
+      item = self.browser.GetSelectedItemNumber()
+      if item < 0 or item == self.lastItem:
+        return
+      display = self.proxy.GetDisplayNode()
+      if display is None:
+        return
+
+      if self.fallbackWL is not None:
+        # Restore automatic W/L only if the current manual window is exactly
+        # the one installed by this guard.  If the user adjusted it, preserve
+        # their manual setting across subsequent frames.
+        if (not display.GetAutoWindowLevel()
+            and self._sameWindowLevel(display, self.fallbackWL)):
+          display.AutoWindowLevelOn()
+        self.fallbackWL = None
+
+      if display.GetAutoWindowLevel():
+        self.fallbackWL = _dpetApplyCollapsedAutoWindowFallback(self.proxy)
+      # Otherwise the user has selected manual W/L.  Never change it.
+      self.lastItem = item
+    except Exception:
+      logging.warning('[dPET display] Conditional PET W/L safeguard failed',
+                      exc_info=True)
+
+  def close(self, browserDeleted=False):
+    if not self.active:
+      return
+    self.active = False
+    _dpetPETWindowGuards.pop(self.browserID, None)
+    if not browserDeleted:
+      try:
+        self.browser.RemoveObserver(self.browserObserver)
+        self.browser.RemoveObserver(self.browserDeleteObserver)
+      except Exception:
+        pass
+    try:
+      slicer.mrmlScene.RemoveObserver(self.sceneObserver)
+    except Exception:
+      pass
+
+
+def _dpetWatchPETSequenceDisplay(browser, sequence, proxy):
+  """Activate one conditional W/L guard per dynamic PET sequence browser."""
+  if browser is None or sequence is None or proxy is None:
+    return
+  key = browser.GetID()
+  previous = _dpetPETWindowGuards.get(key)
+  if previous is not None:
+    previous.close()
+  _dpetPETWindowGuards[key] = _dpetPETSequenceWindowGuard(
+    browser, sequence, proxy)
+
+
 class dPETImporterPluginClass(DICOMPlugin):
   """ dPETImporter specific parser
   """
@@ -731,6 +924,655 @@ class dPETImporterPluginClass(DICOMPlugin):
     return loadables
 
 
+  def _resolveEnhancedQuantification(self, ds, frameGroup, sharedGroup):
+    """Return (units, slope, intercept, mapped_min, mapped_max)."""
+    def first(group, name):
+      items = getattr(group, name, None) if group is not None else None
+      return items[0] if items else None
+
+    rwvm = (getattr(frameGroup, 'RealWorldValueMappingSequence', None)
+            or getattr(sharedGroup, 'RealWorldValueMappingSequence', None)
+            or getattr(ds, 'RealWorldValueMappingSequence', None))
+    if rwvm:
+      matches = []
+      for item in rwvm:
+        code = first(item, 'MeasurementUnitsCodeSequence')
+        value = str(getattr(code, 'CodeValue', '')).upper().replace(' ', '')
+        scheme = str(getattr(code, 'CodingSchemeDesignator', '')).upper()
+        units = ('BQML' if scheme == 'UCUM' and value in ('BQ/ML', 'BQ.ML-1')
+                 else 'GML' if scheme == 'UCUM' and value in ('G/ML', 'G.ML-1')
+                 else None)
+        if units:
+          if getattr(item, 'RealWorldValueLUTData', None) is not None:
+            raise ValueError('Enhanced PET non-linear real-world mapping is unsupported')
+          slope = float(item.RealWorldValueSlope)
+          intercept = float(item.RealWorldValueIntercept)
+          low = getattr(item, 'DoubleFloatRealWorldValueFirstValueMapped', None)
+          high = getattr(item, 'DoubleFloatRealWorldValueLastValueMapped', None)
+          if low is None:
+            low = getattr(item, 'RealWorldValueFirstValueMapped', None)
+          if high is None:
+            high = getattr(item, 'RealWorldValueLastValueMapped', None)
+          matches.append((units, slope, intercept,
+                          float(low) if low is not None else None,
+                          float(high) if high is not None else None))
+      # Prefer activity concentration when both activity and SUV maps exist.
+      matches.sort(key=lambda x: x[0] != 'BQML')
+      if not matches:
+        raise ValueError('Enhanced PET mapping lacks supported Bq/mL or g/mL UCUM units')
+      if sum(m[0] == matches[0][0] for m in matches) != 1:
+        raise ValueError('Ambiguous Enhanced PET real-world mappings for the same units')
+      mapping = matches[0]
+    else:
+      # Fall back to rescale only if its physical units are explicitly known.
+      frameType = first(frameGroup, 'PETFrameTypeSequence') or first(
+        sharedGroup, 'PETFrameTypeSequence')
+      units = str(getattr(ds, 'Units', None) or getattr(frameType, 'Units', '')).upper()
+      pvt = first(frameGroup, 'PixelValueTransformationSequence') or first(
+        sharedGroup, 'PixelValueTransformationSequence')
+      if units not in ('BQML', 'GML') or pvt is None:
+        raise ValueError('Enhanced PET has no usable quantitative mapping with units')
+      mapping = (units, float(pvt.RescaleSlope),
+                 float(pvt.RescaleIntercept), None, None)
+
+    import math
+    if (not math.isfinite(mapping[1]) or not math.isfinite(mapping[2])
+        or mapping[1] == 0):
+      raise ValueError('Invalid Enhanced PET pixel-value transformation')
+    low, high = mapping[3:]
+    if ((low is not None and not math.isfinite(low))
+        or (high is not None and not math.isfinite(high))
+        or (low is not None and high is not None and low > high)):
+      raise ValueError('Invalid Enhanced PET real-world mapped pixel range')
+    frameType = first(frameGroup, 'PETFrameTypeSequence') or first(
+      sharedGroup, 'PETFrameTypeSequence')
+    suvType = str(getattr(ds, 'SUVType', None) or getattr(frameType, 'SUVType', None) or 'BW').upper()
+    if mapping[0] == 'GML' and suvType not in ('BW', 'SUVBW'):
+      raise ValueError('Only SUVbw is supported (GML with BW normalization)')
+    return mapping
+
+  def _readEnhancedFrameMetadata(self, filePath):
+    """Validate one Enhanced PET file without reading its pixel data."""
+    import numpy as np
+    import pydicom
+    ds = pydicom.dcmread(filePath, stop_before_pixels=True)
+    if str(getattr(ds, 'SOPClassUID', '')) != '1.2.840.10008.5.1.4.1.1.130':
+      return None
+
+    shared = (getattr(ds, 'SharedFunctionalGroupsSequence', None) or [None])[0]
+    frameGroups = getattr(ds, 'PerFrameFunctionalGroupsSequence', None)
+    if not frameGroups or len(frameGroups) != int(getattr(ds, 'NumberOfFrames', 0)):
+      raise ValueError('Enhanced PET has missing/mismatched per-frame functional groups')
+    if int(getattr(ds, 'SamplesPerPixel', 0)) != 1:
+      raise ValueError('Only single-channel Enhanced PET images are supported')
+    if str(getattr(ds, 'PhotometricInterpretation', '')) != 'MONOCHROME2':
+      raise ValueError('Only MONOCHROME2 Enhanced PET images are supported')
+    rows, cols = int(ds.Rows), int(ds.Columns)
+    if rows <= 0 or cols <= 0:
+      raise ValueError('Invalid Enhanced PET image dimensions')
+    paddingValue = getattr(ds, 'PixelPaddingValue', None)
+    paddingLimit = getattr(ds, 'PixelPaddingRangeLimit', None)
+    if paddingLimit is not None and paddingValue is None:
+      raise ValueError('Enhanced PET PixelPaddingRangeLimit has no PixelPaddingValue')
+
+    def first(group, name):
+      items = getattr(group, name, None) if group is not None else None
+      return items[0] if items else None
+
+    frames = {}
+    sourceToFrame = []
+    mappings = []
+    firstSeen = []
+    for index, fg in enumerate(frameGroups):
+      fc = first(fg, 'FrameContentSequence')
+      if fc is None or getattr(fc, 'TemporalPositionIndex', None) is None:
+        raise ValueError('FrameContentSequence.TemporalPositionIndex missing')
+      t = int(fc.TemporalPositionIndex)
+      stack = str(getattr(fc, 'StackID', ''))
+      sliceIndex = getattr(fc, 'InStackPositionNumber', None)
+      if not stack or sliceIndex is None or t < 1 or int(sliceIndex) < 1:
+        raise ValueError('Enhanced PET stack or in-stack index missing/invalid')
+      if frames and stack != frames[firstSeen[0]]['stack']:
+        raise ValueError('Multiple Enhanced PET stacks are not supported')
+      pm = first(fg, 'PixelMeasuresSequence') or first(shared, 'PixelMeasuresSequence')
+      po = first(fg, 'PlaneOrientationSequence') or first(shared, 'PlaneOrientationSequence')
+      pp = first(fg, 'PlanePositionSequence') or first(shared, 'PlanePositionSequence')
+      if pm is None or po is None or pp is None:
+        raise ValueError('Enhanced PET lacks spatial functional groups')
+      spacing = np.asarray(pm.PixelSpacing, dtype=float)
+      orient = np.asarray(po.ImageOrientationPatient, dtype=float)
+      position = np.asarray(pp.ImagePositionPatient, dtype=float)
+      if spacing.shape != (2,) or orient.shape != (6,) or position.shape != (3,):
+        raise ValueError('Invalid Enhanced PET spatial vectors')
+      if not (np.isfinite(spacing).all() and np.isfinite(orient).all()
+              and np.isfinite(position).all() and np.all(spacing > 0)):
+        raise ValueError('Non-finite Enhanced PET geometry')
+      start = _parse_dicom_datetime_value(getattr(fc, 'FrameAcquisitionDateTime', None))
+      if start is None:
+        raise ValueError('Enhanced PET frame acquisition datetime missing/invalid')
+      duration = getattr(fc, 'FrameAcquisitionDuration', None)
+      duration = float(duration) / 1000.0 if duration is not None else None
+      if duration is not None and (not np.isfinite(duration) or duration <= 0):
+        raise ValueError('Invalid Enhanced PET frame acquisition duration')
+      mapping = self._resolveEnhancedQuantification(ds, fg, shared)
+      mappings.append(mapping)
+      if t not in frames:
+        frames[t] = {'stack': stack, 'start': start, 'duration': duration,
+                     'indices': [], 'slices': {}, 'spacing': spacing, 'orientation': orient,
+                     'unit': mapping[0]}
+        firstSeen.append(t)
+      record = frames[t]
+      k = int(sliceIndex)
+      if k in record['slices']:
+        raise ValueError(f'Duplicate in-stack slice {k} in temporal position {t}')
+      if (record['stack'] != stack or record['start'] != start
+          or record['duration'] != duration or record['unit'] != mapping[0]
+          or not np.allclose(record['spacing'], spacing, atol=1e-5)
+          or not np.allclose(record['orientation'], orient, atol=1e-5)):
+        raise ValueError(f'Inconsistent geometry, timing or units within temporal position {t}')
+      record['indices'].append(index)
+      record['slices'][k] = (index, position)
+      sourceToFrame.append(t)
+
+    if len(frames) < 2:
+      return None  # Existing single-volume importers remain responsible.
+    temporalOrdinals = {value: i for i, value in enumerate(firstSeen)}
+    sourceToFrame = [temporalOrdinals[t] for t in sourceToFrame]
+    if firstSeen != sorted(firstSeen):
+      raise ValueError('Enhanced PET temporal positions are not in ascending order')
+    if any(sourceToFrame[i] < sourceToFrame[i-1] for i in range(1, len(sourceToFrame))):
+      raise ValueError('Interleaved Enhanced PET time points need a different decoder path')
+
+    reference = frames[firstSeen[0]]
+    ref_keys = set(reference['slices'])
+    if len(ref_keys) < 2:
+      raise ValueError('Enhanced PET volume requires at least two spatial slices')
+    orient = reference['orientation']
+    axisI, axisJ = orient[:3], orient[3:]
+    normal = np.cross(axisI, axisJ)
+    if (not np.isclose(np.linalg.norm(axisI), 1, atol=1e-4)
+        or not np.isclose(np.linalg.norm(axisJ), 1, atol=1e-4)
+        or not np.isclose(np.linalg.norm(normal), 1, atol=1e-4)):
+      raise ValueError('Invalid Enhanced PET orientation vectors')
+    ref_sorted = sorted(ref_keys, key=lambda k: np.dot(reference['slices'][k][1], normal))
+    ref_positions = np.asarray([reference['slices'][k][1] for k in ref_sorted])
+    sliceVector = (ref_positions[-1] - ref_positions[0]) / (len(ref_sorted) - 1)
+    if np.dot(sliceVector, normal) <= 0 or np.linalg.norm(sliceVector) < 1e-5:
+      raise ValueError('Invalid Enhanced PET slice progression')
+    for i, pos in enumerate(ref_positions):
+      if not np.allclose(pos, ref_positions[0] + i * sliceVector, atol=0.05):
+        raise ValueError('Enhanced PET reference slices are not evenly spaced')
+    units = reference['unit']
+    starts = []
+    durations = []
+    sourceToK = [None] * len(frameGroups)
+    for fi, t in enumerate(firstSeen):
+      frame = frames[t]
+      if (set(frame['slices']) != ref_keys or frame['unit'] != units
+          or not np.allclose(frame['spacing'], reference['spacing'], atol=1e-5)
+          or not np.allclose(frame['orientation'], orient, atol=1e-5)):
+        raise ValueError(f'Enhanced PET temporal position {t} has incompatible slices')
+      for kIndex, key in enumerate(ref_sorted):
+        src, pos = frame['slices'][key]
+        if not np.allclose(pos, ref_positions[kIndex], atol=0.05):
+          raise ValueError(f'Enhanced PET temporal position {t} changes spatial geometry')
+        sourceToK[src] = kIndex
+      starts.append(frame['start'])
+      durations.append(frame['duration'])
+    if any(starts[i] <= starts[i-1] for i in range(1, len(starts))):
+      raise ValueError('Enhanced PET acquisition times are not strictly increasing')
+
+    # Build IJK-to-RAS using DICOM LPS row, column and measured K vectors.
+    spacing = reference['spacing']
+    lpsMatrix = np.eye(4)
+    lpsMatrix[:3, 0] = axisI * spacing[1]
+    lpsMatrix[:3, 1] = axisJ * spacing[0]
+    lpsMatrix[:3, 2] = sliceVector
+    lpsMatrix[:3, 3] = ref_positions[0]
+    rasMatrix = np.diag([-1., -1., 1., 1.]) @ lpsMatrix
+
+    frameType = first(frameGroups[0], 'PETFrameTypeSequence') or first(
+      shared, 'PETFrameTypeSequence')
+    return {
+      'nFrames': len(firstSeen), 'nSlices': len(ref_sorted),
+      'rows': rows, 'cols': cols, 'units': units,
+      'times': starts, 'durations': durations, 'mappings': mappings,
+      'sourceToK': sourceToK, 'sourceToFrame': sourceToFrame,
+      'sourceFrameNumbers': [[frame['slices'][k][0] + 1 for k in ref_sorted]
+                             for frame in (frames[t] for t in firstSeen)],
+      'rasMatrix': rasMatrix, 'sopInstanceUID': str(ds.SOPInstanceUID),
+      'sopClassUID': str(ds.SOPClassUID),
+      'studyInstanceUID': str(getattr(ds, 'StudyInstanceUID', '')),
+      'seriesInstanceUID': str(getattr(ds, 'SeriesInstanceUID', '')),
+      'frameOfReferenceUID': str(getattr(ds, 'FrameOfReferenceUID', '')),
+      'paddingValue': int(paddingValue) if paddingValue is not None else None,
+      'paddingLimit': int(paddingLimit) if paddingLimit is not None else None,
+      'decayCorrection': str(getattr(ds, 'DecayCorrection', '')),
+      'suvType': str(getattr(ds, 'SUVType', None) or getattr(frameType, 'SUVType', None) or 'BW'),
+    }
+
+  def _enhancedQuantitativeMetadata(self, filePath, firstFrameStart):
+    """Translate Enhanced PET correction/dose metadata to the classic MRML contract."""
+    import math
+    import pydicom
+    ds = pydicom.dcmread(filePath, stop_before_pixels=True)
+    metadata = self._commonPETMetadata(filePath, firstFrameStart)
+    extra = {}
+
+    # Enhanced PET isotope dose is encoded in MBq; the classic helper expects Bq.
+    agents = getattr(ds, 'RadiopharmaceuticalInformationSequence', None) or []
+    doseBq = None
+    if len(agents) == 1:
+      try:
+        doseMBq = float(agents[0].RadionuclideTotalDose)
+        if math.isfinite(doseMBq) and 0 < doseMBq <= 10000:
+          doseBq = doseMBq * 1e6
+          metadata['RadionuclideTotalDose'] = str(doseBq)
+          extra['dPET.Enhanced.DoseSourceUnit'] = 'MBq'
+          extra['dPET.Enhanced.DoseSourceValue'] = str(doseMBq)
+      except (AttributeError, TypeError, ValueError, OverflowError):
+        pass
+    if doseBq is None:
+      metadata.pop('RadionuclideTotalDose', None)
+      logging.warning('[dPET Enhanced] Dose unavailable, ambiguous, or outside expected MBq range')
+
+    # Classic CorrectedImage is represented by individual Enhanced PET flags.
+    correctionTags = (
+      ('DecayCorrected', 'DECY'), ('AttenuationCorrected', 'ATTN'),
+      ('ScatterCorrected', 'SCAT'), ('DeadTimeCorrected', 'DTIM'),
+      ('RandomsCorrected', 'RAN'), ('CountLossNormalizationCorrected', 'CLN'),
+      ('SensitivityCalibrated', 'DCAL'), ('PatientMotionCorrected', 'MOTN'),
+    )
+    corrected = [code for tag, code in correctionTags
+                 if str(getattr(ds, tag, '')).upper() == 'YES']
+    if corrected:
+      metadata['CorrectedImage'] = '\\'.join(corrected)
+      extra['dPET.Enhanced.CorrectedImageDerived'] = '1'
+    for tag, _ in correctionTags:
+      text = str(getattr(ds, tag, '') or '').upper()
+      if text in ('YES', 'NO'):
+        extra['dPET.Enhanced.' + tag] = text
+
+    decay = str(getattr(ds, 'DecayCorrected', '')).upper()
+    referenceText = str(getattr(ds, 'DecayCorrectionDateTime', '') or '')
+    reference = _parse_dicom_datetime_value(referenceText)
+    if referenceText:
+      extra['dPET.DecayCorrectionDateTime'] = referenceText
+    injected = _parse_dicom_datetime_value(
+      metadata.get('RadionuclideStartDateTime') or
+      metadata.get('RadiopharmaceuticalStartDateTime'))
+    if decay == 'YES':
+      if reference is not None:
+        if abs((reference - firstFrameStart).total_seconds()) <= 1.0:
+          metadata['DecayCorrection'] = 'START'
+        elif injected is not None and abs((reference - injected).total_seconds()) <= 1.0:
+          metadata['DecayCorrection'] = 'ADMIN'
+        else:
+          metadata['DecayCorrection'] = 'ENHANCED'  # Explicit non-START/ADMIN reference.
+      else:
+        metadata['DecayCorrection'] = 'UNKNOWN'
+    elif decay == 'NO':
+      metadata['DecayCorrection'] = 'NONE'
+
+    # A single conversion factor is valid only for a common known decay reference.
+    factor = None
+    try:
+      halfLife = float(metadata['RadionuclideHalfLife'])
+      weightKg = float(metadata['PatientWeight'])
+      if weightKg >= 1000:
+        weightKg *= 0.001
+        metadata['PatientWeight'] = str(weightKg)
+      if (decay == 'YES' and reference is not None and injected is not None
+          and doseBq is not None and halfLife > 0 and weightKg > 0
+          and (reference - injected).total_seconds() >= -1):
+        referenceDoseBq = doseBq * 2 ** (
+          -(reference - injected).total_seconds() / halfLife)
+        if referenceDoseBq > 0:
+          candidate = weightKg * 1000.0 / referenceDoseBq
+          if math.isfinite(candidate) and candidate > 0:
+            factor = candidate
+    except (KeyError, TypeError, ValueError, OverflowError):
+      pass
+    if factor is None:
+      logging.warning('[dPET Enhanced] No validated SUVbw factor: verify dose, weight, '
+                      'half-life, injection time and Enhanced PET decay reference')
+    return metadata, factor, extra
+
+  def examineEnhancedSingleInstance(self, files):
+    """Offer an Enhanced PET loadable only for internally time-resolved files."""
+    if len(files) != 1:
+      return []
+    sop = self._fileValue(files[0], '0008,0016')
+    if sop and sop != '1.2.840.10008.5.1.4.1.1.130':
+      return []
+    try:
+      info = self._readEnhancedFrameMetadata(files[0])
+      if info is None:
+        return []
+      loadable = DICOMLoadable()
+      loadable.files = list(files)
+      desc = self._fileValue(files[0], '0008,103E') or 'Enhanced PET'
+      loadable.name = f'{desc} - {info["nFrames"]} frames Enhanced PET Volume Sequence'
+      loadable.tooltip = (f'Single-instance Enhanced PET, {info["nFrames"]} times x '
+                          f'{info["nSlices"]} slices; units={info["units"]}. '
+                          + ('Timing complete.' if all(x is not None for x in info['durations'])
+                             else 'Frame durations missing: kinetic timing incomplete.'))
+      loadable.selected = True
+      loadable.loadAsVolumeSequence = True
+      loadable.confidence = 0.99
+      loadable.dPETLoadMode = 'enhanced-4d'
+      return [loadable]
+    except Exception as exc:
+      logging.warning('[dPET Enhanced] Recognition rejected: %s', exc)
+      return []
+
+  def _iterEnhancedPixelFrames(self, filePath):
+    """Stream decoded image planes; mmap native pixels on older pydicom."""
+    import numpy as np
+    import pydicom
+    try:
+      from pydicom.pixels import iter_pixels
+    except ImportError:
+      iter_pixels = None
+    if iter_pixels is not None:
+      yield from iter_pixels(filePath)
+      return
+
+    ds = pydicom.dcmread(filePath, stop_before_pixels=True)
+    syntax = str(ds.file_meta.TransferSyntaxUID)
+    endian = {'1.2.840.10008.1.2': '<', '1.2.840.10008.1.2.1': '<',
+              '1.2.840.10008.1.2.2': '>'}.get(syntax)
+    bits = int(getattr(ds, 'BitsAllocated', 0))
+    if (endian is None or bits not in (8, 16, 32) or
+        int(getattr(ds, 'BitsStored', 0)) != bits or
+        int(getattr(ds, 'HighBit', -1)) != bits - 1):
+      raise RuntimeError('Compressed/packed Enhanced PET needs pydicom 3 pixel decoding')
+    deferred = pydicom.dcmread(filePath, defer_size=1024)
+    raw = deferred.get_item((0x7fe0, 0x0010), keep_deferred=True)
+    offset = getattr(raw, 'value_tell', None)
+    length = int(ds.NumberOfFrames) * int(ds.Rows) * int(ds.Columns) * bits // 8
+    if offset is None or getattr(raw, 'length', 0) < length:
+      raise RuntimeError('Cannot locate complete uncompressed Enhanced PET PixelData')
+    kind = 'i' if int(ds.PixelRepresentation) else 'u'
+    dtype = np.dtype((endian if bits > 8 else '|') + kind + str(bits // 8))
+    view = np.memmap(filePath, mode='r', offset=offset, dtype=dtype,
+                     shape=(int(ds.NumberOfFrames), int(ds.Rows), int(ds.Columns)))
+    for index in range(int(ds.NumberOfFrames)):
+      yield view[index]
+
+  def loadEnhancedSingleInstance(self, loadable):
+    """Stream one Enhanced PET instance into a time-resolved Volume Sequence."""
+    import numpy as np
+    path = loadable.files[0]
+    created = []
+    progressbar = None
+    try:
+      info = self._readEnhancedFrameMetadata(path)
+      if info is None:
+        raise ValueError('No internal temporal dimension in Enhanced PET file')
+      times, durations = info['times'], info['durations']
+      if any(d is None for d in durations):
+        logging.warning('[dPET Enhanced] Missing frame duration(s); kinetic timing is incomplete')
+      metadata, enhancedFactor, enhancedAttributes = self._enhancedQuantitativeMetadata(
+        path, times[0])
+      metadata.update({'Units': info['units'], 'SUVType': info['suvType']})
+      framesMeta = []
+      for fi, start in enumerate(times):
+        duration = durations[fi]
+        framesMeta.append({
+          'index': fi, 'acquisitionStartDateTime': self._formatDicomDateTime(start),
+          'acquisitionStartSource': 'DICOM.FrameContent.FrameAcquisitionDateTime',
+          'durationSec': duration,
+          'durationSource': 'DICOM.FrameContent.FrameAcquisitionDuration' if duration is not None else 'Unavailable',
+          'acquisitionEndDateTime': self._formatDicomDateTime(start + timedelta(seconds=duration)) if duration is not None else ''
+        })
+      kinetic = {
+        'schemaVersion': 1, 'metadataSource': 'dPETImporter',
+        'acquisitionKind': 'DYNAMIC', 'seriesType': 'DYNAMIC', 'wholeBody': False,
+        'timingMode': 'FRAMES', 'timingComplete': all(d is not None for d in durations),
+        'spatiallyVaryingTiming': False,
+        'acquisitionStartDateTime': self._formatDicomDateTime(times[0]),
+        'acquisitionEndDateTime': (self._formatDicomDateTime(times[-1] + timedelta(seconds=durations[-1]))
+                                   if durations[-1] is not None else ''),
+        'studyInstanceUID': info['studyInstanceUID'],
+        'seriesInstanceUID': info['seriesInstanceUID'],
+        'frameOfReferenceUID': info['frameOfReferenceUID'],
+        'common': metadata, 'frames': framesMeta,
+      }
+
+      name = loadable.name
+      seq = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLSequenceNode',
+                                                slicer.mrmlScene.GenerateUniqueName(name))
+      created.append(seq)
+      seq.SetIndexName('Frame')
+      seq.SetIndexUnit('index')
+      seq.SetAttribute('dPETImporter.LoadedBy', 'dPETImporterPlugin')
+      seq.SetAttribute('dPETImporter.Source', 'DICOM')
+      seq.SetAttribute('dPETImporter.Version', '0.1')
+      seq.SetAttribute('dPET.FrameType', 'Enhanced-single-instance')
+      seq.SetAttribute('MultiVolume.NumberOfFrames', str(info['nFrames']))
+      seq.SetAttribute('MultiVolume.FrameIdentifyingDICOMTagName', 'TemporalPositionIndex')
+      seq.SetAttribute('MultiVolume.FrameLabels', ','.join(str((t-times[0]).total_seconds()*1000)
+                                                        for t in times))
+      seq.SetAttribute('dPET.FrameTimes', json.dumps([self._formatDicomDateTime(t) for t in times]))
+      seq.SetAttribute('dPET.FrameDurations', json.dumps(durations))
+      # This instance owns every source plane; there is no SOP-per-slice identity.
+      seq.SetAttribute('DICOM.instanceUIDs', info['sopInstanceUID'])
+      for attr, field in (
+          ('DICOM.StudyInstanceUID', 'studyInstanceUID'),
+          ('DICOM.SeriesInstanceUID', 'seriesInstanceUID'),
+          ('DICOM.FrameOfReferenceUID', 'frameOfReferenceUID'),
+          ('DICOM.SOPClassUID', 'sopClassUID')):
+        if info[field]:
+          seq.SetAttribute(attr, info[field])
+      seq.SetAttribute('dPET.Enhanced.PixelPaddingPolicy', 'NaN')
+      self._applyKineticMetadata(seq, kinetic)
+      for key, value in enhancedAttributes.items():
+        seq.SetAttribute(key, str(value))
+      suvbwFactor = enhancedFactor
+      factorValid = suvbwFactor is not None and suvbwFactor > 0
+      suvEnabled = settingsValue('DICOM/dPETImporterSUVEnabled', True, converter=toBool)
+      doSUV = info['units'] == 'BQML' and suvEnabled and factorValid
+      valueType = 'SUVbw' if info['units'] == 'GML' or doSUV else 'BQML'
+      if info['units'] == 'BQML' and suvEnabled and not factorValid:
+        logging.warning('[dPET Enhanced] SUVbw conversion unavailable; retaining Bq/mL')
+      seq.SetAttribute('dPET.ValueType', valueType)
+      seq.SetAttribute('dPET.SUVbwFactorValid', '1' if factorValid else '0')
+      if factorValid:
+        seq.SetAttribute('dPET.SUVbwFactor', str(suvbwFactor))
+
+      # Source frame numbers are 1-based; spatial verification is not classic SOP-per-slice.
+      provenance = {'schemaVersion': 2, 'studyInstanceUID': info['studyInstanceUID'],
+                    'seriesInstanceUID': info['seriesInstanceUID'],
+                    'frameOfReferenceUID': info['frameOfReferenceUID'],
+                    'frames': [{'index': fi, 'instances': [{
+                      'sopInstanceUID': info['sopInstanceUID'],
+                      'sopClassUID': info['sopClassUID']}],
+                      'sourceFrameNumbers': indices, 'spatialOrderVerified': False,
+                      'spatialMapping': 'SINGLE_SOP_ENHANCED_FRAMES'}
+                      for fi, indices in enumerate(info['sourceFrameNumbers'])]}
+      seq.SetAttribute('dPET.DICOM.FrameReferences', json.dumps(provenance, separators=(',', ':')))
+      seq.SetAttribute('dPET.DICOM.ProvenanceSchemaVersion', '2')
+
+      frameNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLScalarVolumeNode', name + ' temporary')
+      created.append(frameNode)
+      transform = vtk.vtkMatrix4x4()
+      for i in range(4):
+        for j in range(4):
+          transform.SetElement(i, j, float(info['rasMatrix'][i, j]))
+      frameNode.SetIJKToRASMatrix(transform)
+      progressbar = slicer.util.createProgressDialog(labelText=f'Loading {name}',
+                                                    value=0, maximum=info['nFrames'],
+                                                    windowModality=qt.Qt.WindowModal)
+      current = None
+      volume = None
+      seen = 0
+      paddingCount = 0
+      for sourceIndex, pixels in enumerate(self._iterEnhancedPixelFrames(path)):
+        if sourceIndex >= len(info['sourceToFrame']):
+          raise ValueError('Decoded more image frames than listed by the DICOM header')
+        temporal = info['sourceToFrame'][sourceIndex]
+        if current is None or temporal != current:
+          if current is not None:
+            self._storeEnhancedFrame(seq, frameNode, volume, current,
+                                     times, durations, valueType, suvbwFactor)
+            progressbar.value = current + 1
+            slicer.app.processEvents()
+            if progressbar.wasCanceled:
+              raise RuntimeError('Enhanced PET loading canceled')
+          current = temporal
+          volume = np.empty((info['nSlices'], info['rows'], info['cols']), dtype=np.float32)
+        pixels = np.asarray(pixels)
+        if pixels.shape != (info['rows'], info['cols']):
+          raise ValueError(f'Decoded image shape differs at source frame {sourceIndex + 1}')
+        units, slope, intercept, lo, hi = info['mappings'][sourceIndex]
+        padding = np.zeros(pixels.shape, dtype=bool)
+        if info['paddingValue'] is not None:
+          first = info['paddingValue']
+          last = info['paddingLimit'] if info['paddingLimit'] is not None else first
+          padding = (pixels >= min(first, last)) & (pixels <= max(first, last))
+        validPixels = pixels[~padding]
+        if (validPixels.size and
+            ((lo is not None and np.min(validPixels) < lo)
+             or (hi is not None and np.max(validPixels) > hi))):
+          raise ValueError(f'Pixels outside real-world mapping range at source frame {sourceIndex + 1}')
+        # Large per-slice intercepts cause cancellation in float32 near zero.
+        volSlice = pixels.astype(np.float64) * slope + intercept
+        if doSUV:
+          volSlice *= float(suvbwFactor)
+        if not np.isfinite(volSlice[~padding]).all():
+          raise ValueError(f'Non-finite calibrated voxels in frame {sourceIndex + 1}')
+        if np.any(padding):
+          paddingCount += int(np.count_nonzero(padding))
+          volSlice[padding] = np.nan  # DICOM padding is not measured zero activity.
+        volume[info['sourceToK'][sourceIndex]] = volSlice.astype(np.float32)
+        seen += 1
+        if sourceIndex % 64 == 0:
+          slicer.app.processEvents()
+          if progressbar.wasCanceled:
+            raise RuntimeError('Enhanced PET loading canceled')
+      if seen != len(info['sourceToFrame']):
+        raise ValueError('Decoded fewer frames than specified by Enhanced PET metadata')
+      self._storeEnhancedFrame(seq, frameNode, volume, current,
+                               times, durations, valueType, suvbwFactor)
+      progressbar.value = info['nFrames']
+      seq.SetAttribute('dPET.Enhanced.PixelPaddingVoxelCount', str(paddingCount))
+      if paddingCount:
+        logging.info('[dPET Enhanced] Preserved %d DICOM padding voxels as NaN', paddingCount)
+
+      browser = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLSequenceBrowserNode', name + ' browser')
+      created.append(browser)
+      browser.SetAndObserveMasterSequenceNodeID(seq.GetID())
+      browser.SetSaveChanges(seq, True)
+      browser.SetOverwriteProxyName(seq, False)
+      browser.SetAttribute('dPETImporter.LoadedBy', 'dPETImporterPlugin')
+      browser.SetAttribute('dPETImporter.SequenceNodeID', seq.GetID())
+      browser.SetAttribute('dPET.ValueType', valueType)
+      if slicer.modules.sequences.widgetRepresentation():
+        slicer.modules.sequences.widgetRepresentation().setActiveBrowserNode(browser)
+      proxy = browser.GetProxyNode(seq)
+      if proxy:
+        created.append(proxy)
+        proxy.SetName(name)
+        proxy.SetAttribute('dPETImporter.LoadedBy', 'dPETImporterPlugin')
+        proxy.SetAttribute('dPET.ValueType', valueType)
+        for attr in ('DICOM.instanceUIDs', 'DICOM.StudyInstanceUID',
+                     'DICOM.SeriesInstanceUID', 'DICOM.FrameOfReferenceUID',
+                     'DICOM.SOPClassUID', 'dPET.Enhanced.PixelPaddingPolicy',
+                     'dPET.Enhanced.PixelPaddingVoxelCount'):
+          value = seq.GetAttribute(attr)
+          if value is not None:
+            proxy.SetAttribute(attr, value)
+        for attr in ('dPET.FrameType', 'dPET.FrameTimes', 'dPET.FrameDurations',
+                     'MultiVolume.NumberOfFrames'):
+          proxy.SetAttribute(attr, seq.GetAttribute(attr))
+        self._applyKineticMetadata(proxy, kinetic)
+        for key, value in enhancedAttributes.items():
+          proxy.SetAttribute(key, str(value))
+        for attr in ('CorrectedImage', 'DecayCorrection', 'PatientWeight',
+                     'RadionuclideHalfLife', 'RadionuclideTotalDose',
+                     'RadionuclideStartDateTime', 'RadiopharmaceuticalStartDateTime',
+                     'dPET.InjectionDateTimeSource', 'dPET.InjectionToAcquisitionOffsetSec'):
+          value = seq.GetAttribute(attr)
+          if value is not None:
+            proxy.SetAttribute(attr, value)
+        proxy.SetAttribute('dPET.SUVbwFactorValid', '1' if factorValid else '0')
+        if factorValid:
+          proxy.SetAttribute('dPET.SUVbwFactor', str(suvbwFactor))
+        try:
+          self._setProxyQuantityUnits(proxy, valueType)
+          proxy.CreateDefaultDisplayNodes()
+          self.setPetDicomLUT(proxy)
+        except Exception:
+          logging.warning('[dPET Enhanced] Display/units decoration failed', exc_info=True)
+          proxy.SetAttribute('dPET.ValueType', valueType)
+        selection = slicer.app.applicationLogic().GetSelectionNode()
+        selection.SetReferenceActiveVolumeID(proxy.GetID())
+        slicer.app.applicationLogic().PropagateVolumeSelection()
+      self.addSeriesInSubjectHierarchy(loadable, proxy or seq)
+      _dpetWatchPETSequenceDisplay(browser, seq, proxy)
+      slicer.mrmlScene.RemoveNode(frameNode)
+      created.remove(frameNode)
+      return seq
+    except Exception:
+      logging.exception('[dPET Enhanced] Loading failed')
+      for node in reversed(created):
+        if node and node.GetScene():
+          slicer.mrmlScene.RemoveNode(node)
+      return None
+    finally:
+      if progressbar is not None:
+        progressbar.close()
+
+  def _storeEnhancedFrame(self, seq, frameNode, pixels, frameIndex,
+                          times, durations, valueType, suvbwFactor):
+    """Copy a decoded volume into the sequence with per-frame metadata."""
+    slicer.util.updateVolumeFromArray(frameNode, pixels)
+    if frameIndex < 4 or settingsValue('DICOM/detailedLogging', False, converter=toBool):
+      import numpy as np
+      valid = pixels[np.isfinite(pixels)]
+      if valid.size:
+        logging.info('[dPET Enhanced] Temporal frame %d voxel range: %.8g .. %.8g, '
+                     'nonzero=%d/%d', frameIndex + 1, float(np.min(valid)),
+                     float(np.max(valid)), int(np.count_nonzero(valid)), pixels.size)
+      else:
+        logging.info('[dPET Enhanced] Temporal frame %d contains only padding', frameIndex + 1)
+    idx = str(frameIndex)
+    timeText = self._formatDicomDateTime(times[frameIndex])
+    frameNode.SetAttribute('dPETImporter.LoadedBy', 'dPETImporterPlugin')
+    frameNode.SetAttribute('dPET.ValueType', valueType)
+    # Preserve source identity and quantitative/correction metadata on each frame.
+    sharedAttrs = ('Units', 'SUVType', 'CorrectedImage', 'DecayCorrection',
+                   'PatientWeight', 'RadionuclideHalfLife', 'RadionuclideTotalDose',
+                   'RadionuclideStartDateTime', 'RadiopharmaceuticalStartDateTime',
+                   'RadiopharmaceuticalStartTime', 'dPET.DecayCorrectionDateTime',
+                   'dPET.FirstFrameAcquisitionDateTime',
+                   'dPET.InjectionDateTimeSource', 'dPET.InjectionToAcquisitionOffsetSec',
+                   'DICOM.instanceUIDs', 'DICOM.StudyInstanceUID',
+                   'DICOM.SeriesInstanceUID', 'DICOM.FrameOfReferenceUID',
+                   'DICOM.SOPClassUID', 'dPET.Enhanced.PixelPaddingPolicy')
+    sharedAttrs += tuple(attr for attr in seq.GetAttributeNames()
+                         if attr.startswith('dPET.Enhanced.'))
+    for attr in sharedAttrs:
+      value = seq.GetAttribute(attr)
+      if value is not None:
+        frameNode.SetAttribute(attr, value)
+    frameNode.SetAttribute('dPET.AcquisitionTime', timeText)
+    frameNode.SetAttribute('dPET.SUVbwFactorValid', '1' if suvbwFactor else '0')
+    if suvbwFactor:
+      frameNode.SetAttribute('dPET.SUVbwFactor', str(suvbwFactor))
+    else:
+      frameNode.SetAttribute('dPET.SUVbwFactor', None)
+    duration = durations[frameIndex]
+    frameNode.SetAttribute('dPET.Duration', str(duration) if duration is not None else None)
+    seq.SetAttribute(f'dPET.Frame.{idx}.AcquisitionTime', timeText)
+    if duration is not None:
+      seq.SetAttribute(f'dPET.Frame.{idx}.Duration', str(duration))
+    seq.SetAttribute(f'dPET.Frame.{idx}.SUVbwFactorValid', '1' if suvbwFactor else '0')
+    if suvbwFactor:
+      seq.SetAttribute(f'dPET.Frame.{idx}.SUVbwFactor', str(suvbwFactor))
+    seq.SetDataNodeAtValue(frameNode, idx)
+
   def examine(self,fileLists):
     dynamicEnabled = settingsValue("DICOM/dPETImporterEnabled", True, converter=toBool)
     staticEnabled = settingsValue("DICOM/dPETImporterStaticEnabled", True, converter=toBool)
@@ -739,6 +1581,7 @@ class dPETImporterPluginClass(DICOMPlugin):
 
     self.detailedLogging = settingsValue('DICOM/detailedLogging', False, converter=toBool)
     dynamicLoadables = []
+    enhancedLoadables = []
     staticLoadables = []
     allfiles = []
     lastFiles = []
@@ -746,12 +1589,18 @@ class dPETImporterPluginClass(DICOMPlugin):
       petFiles = self._petImageFiles(files)
       if not petFiles:
         continue
-      lastFiles = petFiles
+      enhanced = []
       if dynamicEnabled:
-        dynamicLoadables += self.examineFiles(petFiles)
+        enhanced = self.examineEnhancedSingleInstance(petFiles)
+        if enhanced:
+          enhancedLoadables += enhanced
+        else:
+          dynamicLoadables += self.examineFiles(petFiles)
       if staticEnabled:
         staticLoadables += self.examineStaticFiles(petFiles)
-      allfiles += petFiles
+      if not enhanced:
+        lastFiles = petFiles
+        allfiles += petFiles
 
     if dynamicEnabled and (not dynamicLoadables) and lastFiles and len(allfiles) > len(lastFiles):
       dynamicLoadables += self.examineFilesMultiseries(allfiles)
@@ -793,7 +1642,7 @@ class dPETImporterPluginClass(DICOMPlugin):
         annotate(seqL, isSequence=True)
         seqLoadables.append(seqL)
 
-    return seqLoadables + staticLoadables
+    return seqLoadables + enhancedLoadables + staticLoadables
 
   def nameTooltipFromFile(self, dicomFilePath, nFrames, tagName, descriptionLevel=None):
     seriesNumber = slicer.dicomDatabase.fileValue(dicomFilePath, self.tags['seriesNumber'])
@@ -1643,6 +2492,7 @@ class dPETImporterPluginClass(DICOMPlugin):
     if valueType in ('SUVbw', 'BQML'):
       self._setProxyQuantityUnits(volumeNode, valueType)
     self.setPetDicomLUT(volumeNode)
+    _dpetApplyCollapsedAutoWindowFallback(volumeNode)
 
     appLogic = slicer.app.applicationLogic()
     if appLogic:
@@ -1664,6 +2514,8 @@ class dPETImporterPluginClass(DICOMPlugin):
 
     if getattr(loadable, 'dPETLoadMode', None) == 'static':
       return self._loadStaticPET(loadable)
+    if getattr(loadable, 'dPETLoadMode', None) == 'enhanced-4d':
+      return self.loadEnhancedSingleInstance(loadable)
 
     try:
       mvNode = loadable.multivolume
@@ -1905,6 +2757,8 @@ class dPETImporterPluginClass(DICOMPlugin):
         appLogic.PropagateVolumeSelection()
       # add to subject hierarchy
       self.addSeriesInSubjectHierarchy(loadable, proxyVol if proxyVol else volumeSequenceNode)
+
+      _dpetWatchPETSequenceDisplay(browser, volumeSequenceNode, proxyVol)
 
       # The proxy relationship is now fully established. Disable automatic
       # proxy renaming only at this final stage (equivalent to unchecking
