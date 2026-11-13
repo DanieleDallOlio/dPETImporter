@@ -1133,6 +1133,30 @@ class dPETImporterPluginClass(DICOMPlugin):
 
     frameType = first(frameGroups[0], 'PETFrameTypeSequence') or first(
       shared, 'PETFrameTypeSequence')
+    # Capture original patient/study identity once, directly from the Enhanced
+    # PET header. The sequence preserves it across MRML saves and transfers;
+    # later DICOM exports must not need the original file or DICOM database.
+    patientStudy = {}
+    for keyword in (
+        'SpecificCharacterSet', 'PatientName', 'PatientID',
+        'PatientBirthDate', 'PatientSex', 'PatientAge', 'PatientSize',
+        'PatientWeight', 'StudyDate', 'StudyTime', 'AccessionNumber',
+        'StudyID', 'ReferringPhysicianName', 'PerformingPhysicianName',
+        'OperatorsName', 'InstitutionName', 'InstitutionAddress'):
+      value = getattr(ds, keyword, None)
+      if value is None:
+        continue
+      if keyword == 'SpecificCharacterSet' and not isinstance(value, str):
+        # pydicom can return a multi-valued character set designation.
+        try:
+          value = [str(item).strip() for item in value if str(item).strip()]
+        except TypeError:
+          value = str(value).strip()
+      else:
+        value = str(value).strip()
+      if value:
+        patientStudy[keyword] = value
+
     return {
       'nFrames': len(firstSeen), 'nSlices': len(ref_sorted),
       'rows': rows, 'cols': cols, 'units': units,
@@ -1145,6 +1169,7 @@ class dPETImporterPluginClass(DICOMPlugin):
       'studyInstanceUID': str(getattr(ds, 'StudyInstanceUID', '')),
       'seriesInstanceUID': str(getattr(ds, 'SeriesInstanceUID', '')),
       'frameOfReferenceUID': str(getattr(ds, 'FrameOfReferenceUID', '')),
+      'patientStudy': patientStudy,
       'paddingValue': int(paddingValue) if paddingValue is not None else None,
       'paddingLimit': int(paddingLimit) if paddingLimit is not None else None,
       'decayCorrection': str(getattr(ds, 'DecayCorrection', '')),
@@ -1385,6 +1410,7 @@ class dPETImporterPluginClass(DICOMPlugin):
       provenance = {'schemaVersion': 2, 'studyInstanceUID': info['studyInstanceUID'],
                     'seriesInstanceUID': info['seriesInstanceUID'],
                     'frameOfReferenceUID': info['frameOfReferenceUID'],
+                    'patientStudy': info['patientStudy'],
                     'frames': [{'index': fi, 'instances': [{
                       'sopInstanceUID': info['sopInstanceUID'],
                       'sopClassUID': info['sopClassUID']}],
